@@ -1,0 +1,6 @@
+id=openbox_android
+name=Open-Box for Android (SukiSU / KernelSU)
+version=v2.0.7-coloros-ready
+versionCode=2070
+author=liandu2024 & Assistant
+description=Open-Box 一体化透明代理 Android 深度定制成熟版。专为 ColorOS / HyperOS / 原生 Android 深度优化：开机延迟自愈、网络热插拔看门狗、ColorOS 防火墙净化、全真应用分流黑名单，开机即用、长期稳定。

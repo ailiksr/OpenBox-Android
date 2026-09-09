@@ -1,0 +1,71 @@
+name: Build & Release OpenBox Android Module
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js & pnpm
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        run: corepack enable && corepack prepare pnpm@latest --activate
+
+      - name: Download Precompiled Binaries
+        run: |
+          mkdir -p bin node/bin node/lib
+          
+          # 1. Download official statically compiled sing-box
+          SINGBOX_VER="1.13.14"
+          echo "Downloading sing-box v${SINGBOX_VER}..."
+          curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-arm64-musl.tar.gz" -o singbox.tar.gz
+          tar -xzf singbox.tar.gz
+          mv sing-box-*/sing-box bin/sing-box
+          chmod +x bin/sing-box
+          rm -rf sing-box-* singbox.tar.gz
+
+          # 2. Download musl Node.js aarch64 runtime
+          NODE_VER="24.18.0"
+          echo "Downloading musl Node v${NODE_VER}..."
+          curl -fsSL "https://unofficial-builds.nodejs.org/download/release/v${NODE_VER}/node-v${NODE_VER}-linux-arm64-musl.tar.xz" -o node.tar.xz
+          tar -xJf node.tar.xz
+          mv node-v${NODE_VER}-linux-arm64-musl/bin/node node/bin/node.bin
+          chmod +x node/bin/node.bin
+          rm -rf node-v* node.tar.xz
+
+          # 3. Download Alpine musl dynamic loader and C++ runtime
+          ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/aarch64"
+          curl -fsSL "${ALPINE_MIRROR}/musl-1.2.6-r2.apk" -o musl.apk
+          tar -xzf musl.apk lib/ld-musl-aarch64.so.1 lib/libc.musl-aarch64.so.1
+          mv lib/* node/lib/
+          rm -rf lib musl.apk
+
+      - name: Package Magisk/KernelSU Zip
+        run: |
+          VERSION="${GITHUB_REF_NAME:-v2.0.7}"
+          ZIP_NAME="OpenBox-Android-SukiSU-${VERSION}.zip"
+          zip -r "${ZIP_NAME}" * -x ".git*" ".github*" "*.tar.gz" "*.apk"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: "OpenBox for Android ${{ github.ref_name }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            OpenBox-Android-SukiSU-*.zip

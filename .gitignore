@@ -1,0 +1,21 @@
+# Runtime data & state
+data/
+etc/config.json
+etc/config.candidate.json
+etc/config.meta.json
+*.log
+*.sqlite*
+*.db*
+*.tmp*
+*.zip
+*.tar.gz
+
+# Binaries downloaded via build/release scripts
+bin/sing-box
+node/bin/node.bin
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

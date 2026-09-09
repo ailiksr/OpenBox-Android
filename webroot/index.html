@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Open-Box for Android</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body, html { width: 100%; height: 100%; overflow: hidden; background: #0f172a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #f8fafc; }
+        #loading { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; padding: 24px; text-align: center; }
+        .logo-box { width: 64px; height: 64px; background: linear-gradient(135deg, #3b82f6, #1d4ed8); border-radius: 16px; display: flex; align-items: center; justify-content: center; margin-bottom: 20px; box-shadow: 0 10px 25px -5px rgba(59, 130, 246, 0.4); }
+        .logo-icon { font-size: 32px; }
+        .spinner { width: 36px; height: 36px; border: 3px solid rgba(255, 255, 255, 0.1); border-top-color: #60a5fa; border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 20px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        h2 { font-size: 20px; font-weight: 600; margin-bottom: 8px; }
+        p { font-size: 13px; color: #94a3b8; margin-bottom: 24px; line-height: 1.6; max-width: 320px; }
+        .actions { display: flex; gap: 12px; }
+        .btn { background: #2563eb; color: #fff; border: none; border-radius: 10px; padding: 10px 18px; font-size: 14px; font-weight: 500; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; transition: all 0.2s; }
+        .btn:hover { background: #1d4ed8; }
+        .btn-outline { background: rgba(255, 255, 255, 0.08); color: #cbd5e1; }
+        .btn-outline:hover { background: rgba(255, 255, 255, 0.15); }
+        .status { margin-top: 24px; font-size: 12px; color: #64748b; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        <div class="logo-box">
+            <span class="logo-icon">📦</span>
+        </div>
+        <div class="spinner"></div>
+        <h2>正在启动 Open-Box 面板...</h2>
+        <p>正在连接本地 Node.js 运行时。<br>服务就绪后将自动进入管理面板。</p>
+        <div class="actions">
+            <button class="btn" onclick="checkBackend(true)">刷新重试</button>
+            <a class="btn btn-outline" href="http://127.0.0.1:2026">直接跳转</a>
+        </div>
+        <div class="status" id="status-text">探针状态: 正在连接 127.0.0.1:2026...</div>
+    </div>
+
+    <script>
+        const targetUrl = 'http://127.0.0.1:2026';
+        let retries = 0;
+        const maxRetries = 30;
+
+        function checkBackend(manual = false) {
+            const statusEl = document.getElementById('status-text');
+            if (statusEl) statusEl.innerText = '正在连接后台服务...';
+
+            fetch(targetUrl + '/api/health', { method: 'GET', mode: 'no-cors' })
+                .then(() => {
+                    // 彻底抛弃 iframe 嵌入模式，直接导航顶层窗口到 127.0.0.1:2026
+                    // 确保页面成为第一方源 (First-Party)，解决 Android WebView 拦截跨域 Cookie 导致的密码登录循环！
+                    window.location.replace(targetUrl + '/?_t=' + Date.now());
+                })
+                .catch(() => {
+                    retries++;
+                    if (retries < maxRetries) {
+                        setTimeout(() => checkBackend(), 800);
+                    } else {
+                        if (statusEl) {
+                            statusEl.innerHTML = '<span style="color: #f87171;">服务尚未就绪，请在管理器中确认模块已开启。</span>';
+                        }
+                    }
+                });
+        }
+
+        checkBackend();
+    </script>
+</body>
+</html>

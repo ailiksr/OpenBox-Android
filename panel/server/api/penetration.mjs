@@ -1,0 +1,332 @@
+import express from 'express'
+import { collectDirectHosts } from '../engine/direct-hosts.mjs'
+import { builtinTags } from '../engine/user-groups.mjs'
+import { loadEntries } from './rulesets.mjs'
+import { decideDnsServer } from './route-test.mjs'
+import { buildRoute } from '../engine/routing.mjs'
+import { normalizeRouting } from '../engine/routing-model.mjs'
+import { isPrivateOrLoopbackIp } from './net-guard.mjs'
+
+// Open-Box 只管理本机唯一的 sing-box,clash_api 固定监听 127.0.0.1:9095(见 engine/config.mjs)。
+export const CLASH_API_BASE = 'http://127.0.0.1:9095'
+
+// 字面 IP 私有/回环/链路本地/CGNAT 判定抽到 net-guard.mjs,和 subscriptions.mjs 共用同一份
+// 范围表与 IPv4-mapped IPv6 归一化逻辑(P4a 复审 Important 1:两处判定曾经各自维护,
+// 逐渐产生偏差、留下绕过缺口)。
+
+// 核心回归点:`sing-box rule-set match` 命中与不命中退出码都是 0,严禁用退出码判定命中。
+// 经验事实(2026-07-27 对 sing-box 1.13.14 二进制实测):"match rules." 那一行
+// 实际写在 **stderr**,stdout 恒为空——
+//   $ sing-box rule-set match -f binary v.srs baidu.cn 2>/dev/null      → (stdout 为空)
+//   $ sing-box rule-set match -f binary v.srs baidu.cn 2>&1 1>/dev/null → match rules.[0]: ...
+// 因此判定必须同时看 stdout + stderr(而不是只看 stdout),这样即便未来版本把这行
+// 挪回 stdout 也不会再次回归。不要"简化"回只测 stdout。
+//
+// P4b 终审 Important 1:`ctx.exec` 的真实实现(system/context-real.mjs)从不 throw——
+// 二进制缺失、.srs 文件缺失、execFile 本身失败,统统折叠成 `{code:1, stdout:'', stderr:''}`,
+// 和"进程正常跑完、只是没命中"在字节上完全无法区分。此前的实现把这种情况当成"未命中"返回,
+// 于是穿透工具在自己都没能跑起来检查的时候,还会自信地告诉用户"没有规则命中,流量走
+// PROXY"——这正是这个工具应该帮用户排查的那类故障,却在这里说了谎。
+//
+// 因此这里返回一个 { hit, error } 结构(而不是裸 boolean),三态而非两态:
+//   - hit:true                  → 确认命中(看到 "match rules.")
+//   - hit:false, error 未设置   → 确认不命中(进程正常跑完,没找到匹配——退出码 0)
+//   - hit:false, error 已设置   → 没能确认(二进制/.srs 缺失,或进程异常退出且没有任何输出)
+// 调用方(下面的路由 handler)必须把第三种情况当成"不知道",不能当成"确认不命中"。
+export const matchRuleSet = async (ctx, paths, srsPath, target) => {
+  // 前置存在性检查:比"跑了程序、看退出码/输出"更直接地区分"根本没能跑起来"这种情况,
+  // 也不依赖 execFile 失败时 code/stdout/stderr 恰好长什么样子。
+  const [singboxExists, srsExists] = await Promise.all([ctx.exists(paths.singbox), ctx.exists(srsPath)])
+  if (!singboxExists) return { hit: false, error: `sing-box binary not found: ${paths.singbox}` }
+  if (!srsExists) return { hit: false, error: `ruleset file not found: ${srsPath}` }
+
+  const { code, stdout, stderr } = await ctx.exec(paths.singbox, ['rule-set', 'match', '-f', 'binary', srsPath, target])
+  const combined = `${stdout || ''}${stderr || ''}`
+  if (/^match rules\./m.test(combined)) return { hit: true }
+
+  // 命中信息不在输出里。退出码本身对"命中与否"没有意义(见上),但一次真正跑完并给出
+  // 明确"不命中"结果的调用,退出码是 0(即便这行以后又从 stderr 挪回别处,"跑完了、没
+  // 报错"依然应该是 code 0)。code 非 0 又完全没有输出,是"进程没能正常跑完"最朴素的信号
+  // ——例如 execFile 本身 spawn 失败(命令不存在/不可执行)时,context-real.mjs 就是这样
+  // 折叠的:{code:1, stdout:'', stderr:''}。这种情况不能读成"确认不命中"。
+  if (code !== 0 && !stdout && !stderr) {
+    return { hit: false, error: `sing-box rule-set match exited ${code} with no output` }
+  }
+  return { hit: false }
+}
+
+// 一条规则里可能挂着多个规则集(策略允许填多个),任一命中即算这条规则命中。
+// 任何一个没能确认,整条就是"不知道"——理由同 matchRuleSet 的三态说明。
+export const matchRuleSetList = async (ctx, paths, srsPathByTag, ruleSet, target) => {
+  const tags = Array.isArray(ruleSet) ? ruleSet : [ruleSet]
+  for (const tag of tags) {
+    const srsPath = srsPathByTag.get(tag)
+    if (!srsPath) continue
+    const result = await matchRuleSet(ctx, paths, srsPath, target)
+    if (result.error) return result
+    if (result.hit) return { hit: true }
+  }
+  return { hit: false }
+}
+
+// 策略带来的四类条件都能在本地判定,不必去 exec 内核。
+const LOCAL_CONDITION_KEYS = ['domain', 'domain_suffix', 'domain_keyword', 'ip_cidr']
+
+export const hasLocalCondition = (rule) =>
+  LOCAL_CONDITION_KEYS.some((k) => Object.prototype.hasOwnProperty.call(rule, k))
+
+// 「172.16.0.0/12 是否包含 172.20.1.1」这类判断。只处理 IPv4:策略里写 IPv6 段的
+// 情况极少,而写错一个 v6 判定比老实说"这条没法在本地确认"更糟。
+const ipv4ToInt = (ip) => {
+  const parts = String(ip).split('.')
+  if (parts.length !== 4) return null
+  let out = 0
+  for (const part of parts) {
+    const n = Number(part)
+    if (!Number.isInteger(n) || n < 0 || n > 255) return null
+    out = out * 256 + n
+  }
+  return out
+}
+
+export const ipv4InCidr = (ip, cidr) => {
+  const [network, bitsRaw] = String(cidr).split('/')
+  const bits = bitsRaw === undefined ? 32 : Number(bitsRaw)
+  if (!Number.isInteger(bits) || bits < 0 || bits > 32) return false
+  const target = ipv4ToInt(ip)
+  const base = ipv4ToInt(network)
+  if (target === null || base === null) return false
+  if (bits === 0) return true
+  const mask = (0xffffffff << (32 - bits)) >>> 0
+  return (target & mask) >>> 0 === (base & mask) >>> 0
+}
+
+// sing-box 的语义:domain 全等、domain_suffix 后缀(含"就是它本身")、
+// domain_keyword 子串、ip_cidr 网段包含。同一条规则里各字段取并集。
+export const matchLocalConditions = (rule, target) => {
+  const host = String(target).toLowerCase()
+  const list = (v) => (Array.isArray(v) ? v : v === undefined ? [] : [v])
+
+  if (list(rule.domain).some((d) => String(d).toLowerCase() === host)) return true
+  if (list(rule.domain_suffix).some((d) => {
+    const suffix = String(d).toLowerCase()
+    return host === suffix || host.endsWith(suffix.startsWith('.') ? suffix : `.${suffix}`)
+  })) return true
+  if (list(rule.domain_keyword).some((k) => host.includes(String(k).toLowerCase()))) return true
+  if (list(rule.ip_cidr).some((c) => ipv4InCidr(host, c))) return true
+  return false
+}
+
+// 单条条目(规则集解出来的,或站点集里手写的)是否命中目标——和 matchLocalConditions
+// 同一套语义,多认一个 domain_regex。给「命中了哪一条具体的域名/IP」用。
+export const entryMatches = (type, value, target) => {
+  const host = String(target).toLowerCase()
+  const v = String(value)
+  switch (type) {
+    case 'domain': return v.toLowerCase() === host
+    case 'domain_suffix': {
+      const suffix = v.toLowerCase()
+      return host === suffix || host.endsWith(suffix.startsWith('.') ? suffix : `.${suffix}`)
+    }
+    case 'domain_keyword': return host.includes(v.toLowerCase())
+    case 'domain_regex': try { return new RegExp(v).test(host) } catch { return false }
+    case 'ip_cidr': return ipv4InCidr(host, v)
+    default: return false
+  }
+}
+
+const MAX_MATCHED_ENTRIES = 20
+// 命中的那条规则里,具体是哪些域名/IP 条目匹配上了:手写条件直接比,规则集用内核解码
+// 后逐条比(rulesets.mjs 里有缓存)。解不开的规则集跳过——命中结论已经由 rule-set match
+// 定了,这里只是把"为什么命中"摆出来。
+const collectMatchedEntries = async (ctx, paths, rule, target, fetchImpl) => {
+  const out = []
+  let total = 0
+  const push = (type, value, source) => { total++; if (out.length < MAX_MATCHED_ENTRIES) out.push({ type, value, source }) }
+  const list = (v) => (Array.isArray(v) ? v : v === undefined ? [] : [v])
+  for (const type of LOCAL_CONDITION_KEYS) {
+    for (const value of list(rule[type])) if (entryMatches(type, value, target)) push(type, value, 'custom')
+  }
+  for (const tag of list(rule.rule_set)) {
+    let entries
+    try { entries = await loadEntries(ctx, paths, tag, fetchImpl) } catch { continue }
+    for (const e of entries) if (entryMatches(e.type, e.value, target)) push(e.type, e.value, tag)
+  }
+  return { entries: out, entriesTotal: total }
+}
+
+const errorMessage = (err) => (err instanceof Error ? err.message : String(err))
+
+// target 最终会作为参数传给 `sing-box rule-set match`(execFile,无 shell,不是命令注入),
+// 但以 "-" 开头的值会被 CLI 解析成一个 flag(参数注入)。域名/IP 本身的合法字符集里不含
+// 空格等 shell 元字符,这里只需要一个宽松但明确的形态校验:允许的字符集 + 不能以 "-" 开头,
+// 不需要做完整的域名/IP 语法解析。
+const PENETRATION_TARGET_PATTERN = /^[A-Za-z0-9._:-]+$/
+const isValidPenetrationTarget = (value) => {
+  return typeof value === 'string' && !value.startsWith('-') && PENETRATION_TARGET_PATTERN.test(value)
+}
+
+// 沿 clash_api 的 `now` 字段逐层下钻直到叶子节点(响应里不再有 now)。
+// 任何一步失败(网络不可达/非 2xx/JSON 解析失败)都不让整个请求失败——
+// 降级为只保留已知的 chain(至少含起始的组名本身)+ chainError 说明。
+const resolveChain = async ({ tag, fetchImpl, secret }) => {
+  const chain = [tag]
+  const seen = new Set([tag])
+  let current = tag
+  const MAX_DEPTH = 16 // 防御性上限,避免 now 字段成环时无限循环
+
+  for (let i = 0; i < MAX_DEPTH; i++) {
+    let res
+    try {
+      res = await fetchImpl(`${CLASH_API_BASE}/proxies/${encodeURIComponent(current)}`, {
+        headers: secret ? { Authorization: `Bearer ${secret}` } : {},
+      })
+    } catch (err) {
+      return { chain, chainError: `clash_api unreachable: ${errorMessage(err)}` }
+    }
+    if (!res || !res.ok) {
+      return { chain, chainError: `clash_api responded HTTP ${res ? res.status : 'unknown'}` }
+    }
+    let body
+    try {
+      body = await res.json()
+    } catch (err) {
+      return { chain, chainError: `clash_api response parse failed: ${errorMessage(err)}` }
+    }
+    const now = body && typeof body.now === 'string' && body.now ? body.now : null
+    if (!now || seen.has(now)) break
+    seen.add(now)
+    chain.push(now)
+    current = now
+  }
+  return { chain }
+}
+
+export const registerPenetrationRoutes = (app, { store, ctx, paths, fetchImpl = globalThis.fetch } = {}) => {
+  const router = express.Router({ caseSensitive: true })
+  router.use(express.json({ limit: '1mb' }))
+
+  router.post('/penetration', async (req, res) => {
+    const target = req.body && req.body.target
+    if (typeof target !== 'string' || !target.trim()) {
+      return res.status(400).json({ message: 'target is required' })
+    }
+    if (!isValidPenetrationTarget(target)) {
+      return res.status(400).json({ message: 'target must be a valid domain or IP address' })
+    }
+
+    const profile = store.getProfile()
+    // 和生成配置同一套规则表:内置直连的实际 tag、订阅/节点站点直连那条都要带上,
+    // 否则这里数出来的"第几条"和内核里的对不上
+    const builtin = builtinTags(store.getGroups ? store.getGroups() : [])
+    const directHosts = profile.directForNodes === false
+      ? null
+      : collectDirectHosts(store.getNodes ? store.getNodes() : [], store.getSubscriptions ? store.getSubscriptions() : [])
+    const { route } = buildRoute(profile.routing, profile.rulesetDir, { dnsMode: profile.dns && profile.dns.mode, directTag: builtin.direct, directHosts })
+
+    // tag → 本地 .srs 路径:直接复用 buildRoute 已经算好的 rule_set 映射,
+    // 不再重复拼接(避免与 buildRoute 内部拼接规则出现两处不一致)。
+    const srsPathByTag = new Map(route.rule_set.map((r) => [r.tag, r.path]))
+
+    // 策略组 tag 集合:proxyTag(主 selector)+ 各区域分组名。用来判定
+    // 一个 outbound 是"策略组"(需要经 clash_api 下钻)还是叶子节点/direct(无需下钻)。
+    // 用户自建的节点组、每个站点集的 selector、以及兜底的「其他」也都是"策略组",
+    // 一样要能往下钻:只列地区组的话,命中一个站点集之后就断在那儿,看不到它当前
+    // 选的是哪个节点;而"一条都没命中"落到的正是兜底那个 selector。
+    const routingConf = normalizeRouting(profile.routing)
+    const groupTags = new Set([
+      // 内置的直连/拒绝是出站不是 selector,没有 now 可下钻,不算策略组
+      ...(store.getGroups() || []).filter((g) => !g.kind).map((g) => g.name).filter(Boolean),
+      ...routingConf.activePolicies.map((p) => p.name),
+      routingConf.fallback.name,
+    ])
+
+    let matched = null
+    // 三条规则里第几条(1-based,仅用于 matchError 里的人类可读定位)没能确认检查结果。
+    let matchError
+    for (let i = 0; i < route.rules.length; i++) {
+      const rule = route.rules[i]
+      let hit = false
+      if (Object.prototype.hasOwnProperty.call(rule, 'ip_is_private')) {
+        hit = isPrivateOrLoopbackIp(target)
+      } else if (hasLocalCondition(rule)) {
+        // 策略带来的域名/关键词/CIDR 条件:纯字符串与网段比较,本地算得出来,
+        // 不用去 exec 内核。一条规则里多个条件是"或"的关系,和 sing-box 一致。
+        hit = matchLocalConditions(rule, target)
+        // 同一条规则里还可能带规则集,本地条件没命中时继续用 .srs 判一次
+        if (!hit && Object.prototype.hasOwnProperty.call(rule, 'rule_set')) {
+          const result = await matchRuleSetList(ctx, paths, srsPathByTag, rule.rule_set, target)
+          if (result.error) {
+            matchError = `rule #${i + 1}: ${result.error}`
+            break
+          }
+          hit = result.hit
+        }
+      } else if (Object.prototype.hasOwnProperty.call(rule, 'rule_set')) {
+        const tags = Array.isArray(rule.rule_set) ? rule.rule_set : [rule.rule_set]
+        const srsPath = tags.length === 1 ? srsPathByTag.get(tags[0]) : 'multi'
+        if (!srsPath) {
+          hit = false
+        } else {
+          const result = await matchRuleSetList(ctx, paths, srsPathByTag, rule.rule_set, target)
+          if (result.error) {
+            // 没能确认这一条规则是否命中——sing-box 按顺序首条命中生效,这一条排在
+            // matched/route.final 判定之前,一旦它没法确认,后面所有规则的求值结果和
+            // "落到 final"的结论都不再可信,不能假装什么都没发生地继续走下去(那正是
+            // chainError 在 resolveChain 里遇到中途失败时的处理方式:保留已经确定的部分,
+            // 剩下的老实说"不知道",而不是替用户瞎猜一个看起来完整的答案)。
+            matchError = `rule #${i + 1} (${[rule.rule_set].flat().join(', ')}): ${result.error}`
+            break
+          }
+          hit = result.hit
+        }
+      } else {
+        continue // action:'sniff' / protocol:'dns' hijack-dns 等无条件规则,不参与穿透判定
+      }
+      if (hit) {
+        matched = { index: i, rule }
+        if (rule.outbound !== undefined) matched.outbound = rule.outbound
+        if (rule.action !== undefined) matched.action = rule.action
+        if (!Object.prototype.hasOwnProperty.call(rule, 'ip_is_private')) {
+          Object.assign(matched, await collectMatchedEntries(ctx, paths, rule, target, fetchImpl))
+        }
+        break
+      }
+    }
+
+    // matchError 已设置时 matched 必然仍是 null(上面的循环在设置 matchError 后立刻
+    // break,不会再有机会命中)——但这时的 null 和"确认查完所有规则、真的没有命中"的 null
+    // 含义不同,finalOutbound 不能再自信地报告 route.final(那条没能确认的规则,如果真的
+    // 命中了,结果会完全不同)。
+    const finalOutbound = matchError ? null : matched ? (matched.outbound !== undefined ? matched.outbound : null) : route.final
+
+    let chain = finalOutbound !== null && finalOutbound !== undefined ? [finalOutbound] : []
+    let chainError
+    if (finalOutbound && groupTags.has(finalOutbound)) {
+      const secret = store.getClashSecret()
+      const result = await resolveChain({ tag: finalOutbound, fetchImpl, secret })
+      chain = result.chain
+      chainError = result.chainError
+    }
+
+    const body = { matched, chain, finalOutbound }
+    if (chainError) body.chainError = chainError
+    if (matchError) body.matchError = matchError
+
+    // 顺带按内核里正在跑的配置(etc/config.json)推一下这个域名会用哪台 DNS:
+    // 直连解析还是经某个站点集的 DoH。目标是 IP 就没有解析这一步。
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(target) || target.includes(':')) {
+      body.dns = { skipped: true }
+    } else {
+      try {
+        const config = JSON.parse(await ctx.readFile(paths.configPath))
+        body.dns = await decideDnsServer(ctx, paths, config, target.toLowerCase())
+      } catch (err) {
+        body.dns = { error: `还没有生成过配置,无法判断 DNS(${errorMessage(err)})` }
+      }
+    }
+    res.json(body)
+  })
+
+  app.use('/api/openbox', router)
+}

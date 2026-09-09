@@ -1,0 +1,5 @@
+#!/system/bin/sh
+SCRIPT_DIR=${0%/*}
+BASE_DIR=${SCRIPT_DIR%/*}
+export LD_LIBRARY_PATH="$BASE_DIR/lib"
+exec "$BASE_DIR/lib/ld-musl-aarch64.so.1" --library-path "$BASE_DIR/lib" "$BASE_DIR/bin/node.bin" "$@"
