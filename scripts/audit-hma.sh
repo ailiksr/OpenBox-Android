@@ -109,7 +109,8 @@ EOF
 "$NODE_BIN" /data/local/tmp/hma_audit.mjs
 rm -f /data/local/tmp/hma_audit.mjs
 
-chown u0_a333:u0_a333 "$HMA_CONF"
+HMA_OWNER=$(stat -c '%u:%g' "/data/user/0/com.tsng.hidemyapplist" 2>/dev/null || stat -c '%u:%g' "$HMA_CONF" 2>/dev/null)
+[ -n "$HMA_OWNER" ] && chown "$HMA_OWNER" "$HMA_CONF"
 chmod 600 "$HMA_CONF"
 
 echo "=========================================================="
