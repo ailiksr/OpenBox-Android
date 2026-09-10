@@ -9,7 +9,7 @@ start_panel() {
     cd "$MODDIR/panel"
     export OPENBOX_ROOT="$MODDIR"
     export PORT=2026
-    export HOST="127.0.0.1"
+    export HOST="0.0.0.0"
     nohup "$NODE" "$PANEL_SERVER" > "$LOG" 2>&1 &
 }
 

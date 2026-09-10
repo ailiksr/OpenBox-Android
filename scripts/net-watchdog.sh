@@ -31,8 +31,8 @@ check_and_heal() {
         ip route add local default dev lo table 100 2>/dev/null
     fi
 
-    # 4. 检查 iptables 规则链是否被 netd 冲刷
-    if ! iptables -t nat -C OUTPUT -p tcp -j OPENBOX_TCP 2>/dev/null; then
+    # 4. 检查 iptables 规则链是否被 netd 冲刷 (同时监控本机与热点/网络共享规则链)
+    if ! iptables -t nat -C OUTPUT -p tcp -j OPENBOX_TCP 2>/dev/null || ! iptables -t nat -C PREROUTING -p tcp -j OPENBOX_PRE_TCP 2>/dev/null; then
         sh "$SCRIPTS_DIR/iptables.sh" start >/dev/null 2>&1
         return 0
     fi

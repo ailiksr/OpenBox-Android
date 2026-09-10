@@ -157,7 +157,7 @@ export const buildConfig = ({ nodes, profile, userGroups, systemDns, localSubnet
   const redirectInbound = {
     type: 'redirect',
     tag: 'redirect-in',
-    listen: '127.0.0.1',
+    listen: '0.0.0.0',
     listen_port: 7892,
   }
 
