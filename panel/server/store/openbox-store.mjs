@@ -37,7 +37,7 @@ export const DEFAULT_PROFILE = {
   // 终端分流:按局域网来源 IP 指定出口(engine/client-routes.mjs),默认没有
   clientRoutes: [],
   // mode:off 不碰 DNS / hijack 防火墙劫持 / dnsmasq 转发(默认;见 engine/dns.mjs 与 system/dns-takeover.mjs)
-  dns: { split: true, mode: 'hijack', direct: '223.5.5.5', proxy: '1.1.1.1' },
+  dns: { split: true, mode: 'hijack', direct: '223.5.5.5', proxy: '8.8.8.8' },
   // 每日流量这些分析数据在库里留多久(月)。面板「后端设置」里可改,1~36。
   // 按正式路由器实测,按天的记录一天大约 0.75MB,3 个月 ≈ 70MB;小时明细另外只留 7 天
   // (见 system/traffic-collector.mjs)
