@@ -1,4 +1,4 @@
-export const createPaths = (root = (process.env.OPENBOX_ROOT || '/data/adb/modules/openbox_android')) => ({
+export const createPaths = (root = process.env.OPENBOX_ROOT || '/data/adb/modules/openbox_android') => ({
   root,
   bin: `${root}/bin`,
   singbox: `${root}/bin/sing-box`,
@@ -22,8 +22,5 @@ export const createPaths = (root = (process.env.OPENBOX_ROOT || '/data/adb/modul
   updateLogPath: '/tmp/openbox-update.log',
   geoUpdateStatePath: `${root}/data/geo-update.json`,
   scheduleStatePath: `${root}/data/schedule-state.json`,
-  initd: {
-    core: process.env.OPENBOX_INITD_CORE || `${root}/scripts/service-core.sh`,
-    panel: process.env.OPENBOX_INITD_PANEL || `${root}/scripts/service-panel.sh`
-  },
+  initd: { core: '/etc/init.d/openbox', panel: '/etc/init.d/openbox-panel' },
 })

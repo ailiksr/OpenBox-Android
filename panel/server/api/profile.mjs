@@ -1,7 +1,9 @@
 import express from 'express'
+import { validateDnsFilter } from '../engine/dns-filter.mjs'
+import { DNS_REWRITE_DEFAULTS, validateDnsRewrite } from '../engine/dns-rewrite.mjs'
 import { RESERVED_PORTS, SERVER_PROTOCOLS, SS_METHODS } from '../engine/servers.mjs'
-import { isIpOrCidr } from '../engine/client-routes.mjs'
-import { FALLBACK_TAG, normalizeRouting } from '../engine/routing-model.mjs'
+import { isIpOrCidr, isMac } from '../engine/client-routes.mjs'
+import { CUSTOM_RULE_TYPES, FALLBACK_TAG, normalizeRouting, parsePortSpec } from '../engine/routing-model.mjs'
 import { ICON_SCALE_LIMIT, builtinTags, normalizeGroups } from '../engine/user-groups.mjs'
 import { DNSMASQ_OUTBOUND_TAG } from '../engine/config.mjs'
 
@@ -45,9 +47,16 @@ const isIconScale = (v) => Number.isInteger(v) && Math.abs(v) <= ICON_SCALE_LIMI
 
 export const validateProfilePatch = (patch, { reservedNames = [] } = {}) => {
   if (!isPlainObject(patch)) return 'patch must be an object'
+  if (isPlainObject(patch.dns) && 'filter' in patch.dns) {
+    const error = validateDnsFilter(patch.dns.filter)
+    if (error) return error
+  }
 
   if ('ipv6' in patch && !isBoolean(patch.ipv6)) {
     return 'ipv6 must be a boolean'
+  }
+  if ('ipv6Proxy' in patch && !['node', 'ipv4', 'bypass'].includes(patch.ipv6Proxy)) {
+    return 'ipv6Proxy must be one of node, ipv4, bypass'
   }
   if ('directForNodes' in patch && !isBoolean(patch.directForNodes)) {
     return 'directForNodes must be a boolean'
@@ -122,6 +131,11 @@ export const validateProfilePatch = (patch, { reservedNames = [] } = {}) => {
     if ('mode' in dns && !DNS_MODES.has(dns.mode)) {
       return 'dns.mode must be one of off, hijack, dnsmasq'
     }
+    if ('fakeIpForProxy' in dns && !isBoolean(dns.fakeIpForProxy)) return 'dns.fakeIpForProxy must be a boolean'
+    if ('rewrite' in dns) {
+      const bad = validateDnsRewrite(dns.rewrite)
+      if (bad) return bad
+    }
   }
 
   if ('routing' in patch) {
@@ -174,6 +188,11 @@ export const validateProfilePatch = (patch, { reservedNames = [] } = {}) => {
       return 'routing.displayOrder must be an array of strings'
     }
 
+    if ('custom' in routing) {
+      const error = validateCustomPolicy(routing.custom)
+      if (error) return error
+    }
+
     if ('policies' in routing) {
       const error = validatePolicies(routing.policies, isString(routing.fallbackName) ? routing.fallbackName.trim() : '', reservedNames)
       if (error) return error
@@ -208,7 +227,16 @@ export const validateClientRoutes = (list) => {
     if (!isStringArray(r.sources) || !r.sources.length) return 'clientRoutes[].sources must be a non-empty array of strings'
     const bad = r.sources.find((x) => !isIpOrCidr(x))
     if (bad !== undefined) return `clientRoutes[].sources contains an invalid IP/CIDR: ${bad}`
-    if (!isString(r.outbound) || !r.outbound.trim()) return 'clientRoutes[].outbound must be a non-empty string'
+    if ('bypass' in r && !isBoolean(r.bypass)) return 'clientRoutes[].bypass must be a boolean'
+    if ('macs' in r && !isStringArray(r.macs)) return 'clientRoutes[].macs must be an array of strings'
+    if (r.bypass === true) {
+      // 不进内核:按 MAC 放行,至少一个合法 MAC;出站不用填
+      if (!Array.isArray(r.macs) || !r.macs.length) return 'clientRoutes[].macs is required when bypass is true'
+      const badMac = r.macs.find((x) => !isMac(x))
+      if (badMac !== undefined) return `clientRoutes[].macs contains an invalid MAC: ${badMac}`
+    } else if (!isString(r.outbound) || !r.outbound.trim()) {
+      return 'clientRoutes[].outbound must be a non-empty string'
+    }
   }
   return null
 }
@@ -235,6 +263,11 @@ export const validateServers = (servers) => {
     if ('address' in s && !isString(s.address)) return 'servers[].address must be a string'
     if ('tls' in s && !isBoolean(s.tls)) return 'servers[].tls must be a boolean'
     if ('obfs' in s && !isString(s.obfs)) return 'servers[].obfs must be a string'
+    if ('username' in s && !isString(s.username)) return 'servers[].username must be a string'
+    // mixed 的认证可选,但用户名和密码要成对:只有其中一个,客户端那边没法填
+    if (s.protocol === 'mixed' && Boolean(s.username) !== Boolean(s.password)) {
+      return 'servers[].username and password must be set together for mixed'
+    }
     const needPassword = s.protocol === 'shadowsocks' || s.protocol === 'tuic' || s.protocol === 'hysteria2'
     if (needPassword && (!isString(s.password) || !s.password)) return `servers[].password is required for ${s.protocol}`
     const needUuid = s.protocol === 'vless' || s.protocol === 'tuic'
@@ -248,6 +281,45 @@ export const validateServers = (servers) => {
 // 其余条件(域名/关键词/CIDR)只会进 JSON 配置的值位,不参与路径拼接,所以只做
 // 类型检查,不限制字符——域名里带下划线、CIDR 带斜杠都是合法的。
 const POLICY_LIST_FIELDS = ['domain', 'domainSuffix', 'domainKeyword', 'ipCidr']
+
+// 前置自定义分流(routing.custom):固定置顶那一条,一行一条规则、一行一个出口。
+// 名字只是界面上的标题,不当出站 tag 用,所以不查重名;但每行的 outbound 会原样写进内核
+// 规则的 outbound 字段,规则集名会被拼进 .srs 路径,这两处照站点集同一道校验来。
+const validateCustomPolicy = (custom) => {
+  if (!isPlainObject(custom)) return 'routing.custom must be an object'
+  if ('name' in custom && (!isString(custom.name) || !custom.name.trim())) {
+    return 'routing.custom.name must be a non-empty string'
+  }
+  if ('icon' in custom && !isString(custom.icon)) return 'routing.custom.icon must be a string'
+  if ('iconScale' in custom && !isIconScale(custom.iconScale)) {
+    return `routing.custom.iconScale must be an integer within ±${ICON_SCALE_LIMIT}`
+  }
+  if ('enabled' in custom && !isBoolean(custom.enabled)) return 'routing.custom.enabled must be a boolean'
+  if ('rules' in custom) {
+    if (!Array.isArray(custom.rules)) return 'routing.custom.rules must be an array'
+    for (const r of custom.rules) {
+      if (!isPlainObject(r)) return 'routing.custom.rules entries must be objects'
+      if (!CUSTOM_RULE_TYPES.includes(r.type)) {
+        return `routing.custom.rules[].type must be one of ${CUSTOM_RULE_TYPES.join(', ')}`
+      }
+      if (!isString(r.value) || !r.value.trim()) return 'routing.custom.rules[].value is required'
+      if (!isString(r.outbound) || !r.outbound.trim()) return 'routing.custom.rules[].outbound is required'
+      if (r.type === 'ruleUrl' && !/^https?:\/\//i.test(r.value.trim())) {
+        return 'routing.custom.rules[].value must be an http(s) URL when type is ruleUrl'
+      }
+      if (r.type === 'port' && !parsePortSpec(r.value)) {
+        return 'routing.custom.rules[].value must be ports like 51820 or 1000-2000 (comma separated) when type is port'
+      }
+      if (r.type === 'geosite' || r.type === 'geoip' || r.type === 'ruleset') {
+        const tag = r.type === 'ruleset' ? r.value.trim() : `${r.type}-${r.value.trim()}`
+        if (!isValidRulesetTag(tag)) {
+          return 'routing.custom.rules[] ruleset name must match /^[A-Za-z0-9._-]+$/'
+        }
+      }
+    }
+  }
+  return null
+}
 
 const validatePolicies = (policies, fallbackName = '', reservedNames = []) => {
   if (!Array.isArray(policies)) return 'routing.policies must be an array'
@@ -310,7 +382,8 @@ export const registerProfileRoutes = (app, { store } = {}) => {
   // 区域推荐默认——放在 GET / 前面注册,和 subscriptions.mjs 里 /preview 先于 / 的顺序一致,
   // 虽然这里都是字面量路径不存在遮蔽问题,但保持同样的可读习惯。
   router.get('/defaults', (req, res) => {
-    res.json({ defaults: buildRegionDefaults(req.query.region) })
+    // dnsRewriteDefaults:「DNS 重写」卡片的「恢复默认」按它把两条默认项放回去
+    res.json({ defaults: buildRegionDefaults(req.query.region), dnsRewriteDefaults: DNS_REWRITE_DEFAULTS })
   })
 
   // 地区层退役的一次性升级:老档案里的地区被翻译成站点集(engine/routing-model.mjs),

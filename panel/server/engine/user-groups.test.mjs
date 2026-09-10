@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { BUILTIN_IDS, builtinTags, emitUserGroups, defaultGroups, normalizeGroup, normalizeGroups, GROUP_TYPES } from './user-groups.mjs'
+import { BUILTIN_IDS, builtinTags, emitUserGroups, defaultGroups, normalizeGroup, normalizeGroups, GROUP_TYPES, FAILOVER_REJECT_TAG, isInternalTag } from './user-groups.mjs'
 
 const nodes = ['香港-01', '香港-02', '美国-01'].map((tag) => ({ tag }))
 
@@ -11,8 +11,111 @@ const emitUser = (groups, ns) => {
   return { ...r, outbounds: userOnly(r.outbounds) }
 }
 
-test('sing-box 只有 urltest / selector 两种组类型(Clash 的 fallback 不存在)', () => {
-  assert.deepEqual([...GROUP_TYPES], ['urltest', 'selector'])
+test('组类型:内核只有 urltest / selector,failover 是应用层类型(内核里落成 selector + 内部 urltest)', () => {
+  assert.deepEqual([...GROUP_TYPES], ['urltest', 'selector', 'failover'])
+})
+
+const failoverGroup = (over = {}) => ({
+  id: 'fo1', name: '主备', type: 'failover',
+  lanes: [
+    { id: 'A', name: '主用', members: ['香港-01'] },
+    { id: 'B', name: '', members: ['香港-02', '美国-01'] },
+  ],
+  ...over,
+})
+
+test('故障转移:归一化后固定静态、members/keywords 清空、lanes 去重补 id、参数越界回默认', () => {
+  const g = normalizeGroup({
+    ...failoverGroup({ mode: 'dynamic', members: ['x'], keywords: ['y'], interval: '1s', tolerance: -5,
+      failover: { timeoutMs: 999999, failureThreshold: 0, restorePrimary: false, recoveryHoldMs: 'abc' } }),
+    lanes: [
+      { id: 'A', members: ['香港-01', '香港-01', '', 3] },
+      { members: ['香港-02'] },
+      { id: 'A', name: ' 备 ', members: [] },
+    ],
+  })
+  assert.equal(g.type, 'failover')
+  assert.equal(g.mode, 'static')
+  assert.deepEqual(g.members, [])
+  assert.deepEqual(g.keywords, [])
+  assert.deepEqual(g.lanes, [
+    { id: 'A', name: '', icon: '', members: ['香港-01'] },
+    { id: 'lane-2', name: '', icon: '', members: ['香港-02'] },
+    { id: 'A~', name: '备', icon: '', members: [] },
+  ])
+  assert.equal(g.interval, '30s')
+  assert.equal(g.tolerance, 100)
+  assert.deepEqual(g.failover, { timeoutMs: 5000, failureThreshold: 2, restorePrimary: false, recoveryHoldMs: 60000 })
+  // 页签最多 3 个,多出来的读取时丢掉(写入时 API 直接拒)
+  const many = normalizeGroup(failoverGroup({ lanes: [1, 2, 3, 4, 5].map((i) => ({ id: `L${i}`, members: ['香港-01'] })) }))
+  assert.deepEqual(many.lanes.map((l) => l.id), ['L1', 'L2', 'L3'])
+})
+
+test('故障转移:单节点页签直接引用节点,多节点页签生成内部 urltest 子组;父组是 selector,默认主用,末位兜底拒绝', () => {
+  const { outbounds, failover, internalTags, publicTags } = emitUser([...defaultGroups(), failoverGroup()], nodes)
+  const parent = outbounds.find((o) => o.tag === '主备')
+  const sub = outbounds.find((o) => o.type === 'urltest' && isInternalTag(o.tag))
+  assert.ok(sub, '多节点页签应生成内部 urltest 子组')
+  assert.equal(sub.tag, '__fo:fo1:B')
+  assert.deepEqual(sub.outbounds, ['香港-02', '美国-01'])
+  assert.equal(sub.interval, '30s')
+  assert.equal(sub.tolerance, 100)
+  assert.equal(sub.idle_timeout, '12h')
+  assert.deepEqual(parent, {
+    type: 'selector', tag: '主备', outbounds: ['香港-01', '__fo:fo1:B', '拒绝'], default: '香港-01', interrupt_exist_connections: true,
+  })
+  // 子组排在父组前面(内核要求引用的出站先定义不是硬性的,但顺序稳定便于对照)
+  assert.ok(outbounds.indexOf(sub) < outbounds.indexOf(parent))
+  assert.deepEqual(internalTags, ['__fo:fo1:B'])
+  assert.ok(!publicTags.includes('__fo:fo1:B'))
+  assert.ok(publicTags.includes('主备'))
+  assert.equal(failover.length, 1)
+  assert.equal(failover[0].tag, '主备')
+  assert.equal(failover[0].rejectTag, '拒绝')
+  assert.deepEqual(failover[0].lanes.map((l) => [l.id, l.mode, l.ref]), [['A', 'single', '香港-01'], ['B', 'urltest', '__fo:fo1:B']])
+  assert.equal(failover[0].settings.intervalMs, 30000)
+  assert.equal(failover[0].settings.failureThreshold, 2)
+})
+
+test('故障转移:失效节点不算有效成员;页签全空的组只剩兜底拒绝,不补直连;内置拒绝停用时用内部 block', () => {
+  const groups = [
+    ...defaultGroups().map((g) => (g.id === BUILTIN_IDS.block ? { ...g, enabled: false } : g)),
+    failoverGroup({ lanes: [
+      { id: 'A', members: ['已删节点', '香港-01'] },
+      { id: 'B', members: ['也删了'] },
+    ] }),
+    failoverGroup({ id: 'fo2', name: '全空', lanes: [{ id: 'A', members: ['无'] }] }),
+  ]
+  const { outbounds, failover, placeholders, internalTags } = emitUserGroups(groups, nodes)
+  const parent = outbounds.find((o) => o.tag === '主备')
+  assert.deepEqual(parent.outbounds, ['香港-01', FAILOVER_REJECT_TAG])
+  assert.equal(parent.default, '香港-01')
+  assert.deepEqual(failover[0].lanes.map((l) => [l.mode, l.valid]), [['single', ['香港-01']], ['empty', []]])
+  const empty = outbounds.find((o) => o.tag === '全空')
+  assert.deepEqual(empty.outbounds, [FAILOVER_REJECT_TAG])
+  assert.equal(empty.default, FAILOVER_REJECT_TAG)
+  assert.equal(outbounds.filter((o) => o.tag === FAILOVER_REJECT_TAG).length, 1)
+  assert.equal(outbounds.find((o) => o.tag === FAILOVER_REJECT_TAG).type, 'block')
+  assert.ok(internalTags.includes(FAILOVER_REJECT_TAG))
+  assert.ok(!placeholders.some((p) => p.name === '全空'), '故障转移组不用直连占位')
+  assert.ok(!outbounds.some((o) => o.tag === '拒绝'), '停用的内置拒绝不会被故障转移拉回配置')
+})
+
+test('故障转移:两个单节点页签引用同一个节点时父组成员去重;页签只引用节点,写了组名不算有效', () => {
+  const { outbounds, failover } = emitUser([...defaultGroups(), failoverGroup({ lanes: [
+    { id: 'A', members: ['香港-01'] },
+    { id: 'B', members: ['香港-01'] },
+    { id: 'C', members: ['所有-自动'] },
+  ] })], nodes)
+  const parent = outbounds.find((o) => o.tag === '主备')
+  assert.deepEqual(parent.outbounds, ['香港-01', '拒绝'])
+  assert.deepEqual(failover[0].lanes.map((l) => l.mode), ['single', 'single', 'empty'])
+})
+
+test('故障转移:别的组可以把故障转移父组当成员,但拿不到内部子组', () => {
+  const groups = [...defaultGroups(), failoverGroup(), { id: 'u', name: '手动', type: 'selector', mode: 'static', members: ['主备', '__fo:fo1:B'] }]
+  const { outbounds } = emitUser(groups, nodes)
+  assert.deepEqual(outbounds.find((o) => o.tag === '手动').outbounds, ['主备'])
 })
 
 test('默认两个组:所有-自动(urltest) 与 所有-手动(selector),成员都是全部节点', () => {
@@ -252,7 +355,7 @@ test('url-test 组的测速地址:组里填了用组的,没填用档案里的全
   const withGlobal = userOnly(emitUserGroups(groups, nodes, { testUrl: 'http://global.test/204' }).outbounds)
   assert.deepEqual(withGlobal.map((o) => o.url), ['http://a.test/204', 'http://global.test/204'])
   const noGlobal = userOnly(emitUserGroups(groups, nodes).outbounds)
-  assert.equal(noGlobal[1].url, 'http://www.gstatic.com/generate_204')
+  assert.equal(noGlobal[1].url, 'https://www.gstatic.com/generate_204')
 })
 
 test('自动择优组带 idle_timeout:内核默认 30 分钟不用就停止健康检查,停了就一直挂在失效的线路上', () => {
@@ -297,4 +400,11 @@ test('interval 比 idle_timeout 长时 idle_timeout 抬到和 interval 一样(si
   const group = outbounds.find((o) => o.tag === '自动')
   assert.equal(group.interval, '1440m')
   assert.equal(group.idle_timeout, '1440m')
+})
+
+test('动态组按关键词选成员时把识别出的地区名也算上:订阅关了重命名、节点叫 US-01 也能进「美国-自动」', () => {
+  const ns = [{ tag: 'US-01', regionName: '美国' }, { tag: 'HK-01', regionName: '香港' }, { tag: 'Tokyo Node', regionName: '' }]
+  const groups = [{ id: 'g-us', name: '美国-自动', type: 'urltest', mode: 'dynamic', keywords: ['美国'], members: [], enabled: true }]
+  const { outbounds } = emitUser(groups, ns)
+  assert.deepEqual(outbounds.find((o) => o.tag === '美国-自动').outbounds, ['US-01'])
 })

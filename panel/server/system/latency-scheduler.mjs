@@ -12,6 +12,8 @@
 import { CLASH_API_BASE } from '../api/penetration.mjs'
 import { processUptime } from './service.mjs'
 import { parseDuration } from '../engine/duration.mjs'
+import { isInternalTag } from '../engine/user-groups.mjs'
+import { kernelTestUrl } from '../engine/test-url.mjs'
 
 export { parseDuration }
 
@@ -57,9 +59,13 @@ export const createLatencyScheduler = ({
   }
   const readGroups = async () => {
     const cfg = JSON.parse(await ctx.readFile(paths.configPath))
+    // 故障转移的内部子组不在这里调度:它们的检测由 system/failover-manager.mjs 按父组的间隔统一做,两个调度器
+    // 不重复发起同一批检查
     return (cfg.outbounds || [])
-      .filter((o) => o && o.type === 'urltest' && o.tag)
-      .map((o) => ({ tag: o.tag, url: o.url || '', intervalMs: parseDuration(o.interval) || DEFAULT_INTERVAL_MS, members: Array.isArray(o.outbounds) ? o.outbounds : [] }))
+      .filter((o) => o && o.type === 'urltest' && o.tag && !isInternalTag(o.tag))
+      // 组配置里的 url 可能是 http 的(内核自己定时测认),但 /group/:tag/delay 不认 http——会悄悄换成
+      // gstatic 去测,用户改的地址等于没改;先升成 https(engine/test-url.mjs)
+      .map((o) => ({ tag: o.tag, url: kernelTestUrl(o.url || ''), intervalMs: parseDuration(o.interval) || DEFAULT_INTERVAL_MS, members: Array.isArray(o.outbounds) ? o.outbounds : [] }))
   }
 
   // 只读一次 /proxies 把看到的变化记下来,不发起测速(面板手动测完后调用,结果马上进历史)

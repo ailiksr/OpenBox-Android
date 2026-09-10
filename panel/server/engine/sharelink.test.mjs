@@ -185,3 +185,92 @@ test('vmess grpc:v2rayN 把 serviceName 放在 path,存成 service_name;kcp / xh
   assert.equal(parseShareLink('vless://11111111-1111-1111-1111-111111111111@x.example.com:443?type=xhttp&path=%2Fx&security=tls#X'), null)
   assert.equal(parseShareLink('vless://11111111-1111-1111-1111-111111111111@x.example.com:443?type=splithttp&security=tls#X'), null)
 })
+
+test('socks5:// 明文账号密码', () => {
+  const n = parseShareLink('socks5://alice:s3cret@1.2.3.4:1080#本地代理')
+  assert.equal(n.type, 'socks')
+  assert.equal(n.server, '1.2.3.4')
+  assert.equal(n.server_port, 1080)
+  assert.equal(n.fields.username, 'alice')
+  assert.equal(n.fields.password, 's3cret')
+  assert.equal(n.fields.version, undefined)   // 5 是内核默认值,不落库
+  assert.equal(n.originalTag, '本地代理')
+  assert.equal(n.source, 'sharelink')
+})
+
+test('socks5:// 不带认证', () => {
+  const n = parseShareLink('socks5://192.168.1.10:7890#无认证')
+  assert.equal(n.type, 'socks')
+  assert.equal(n.server, '192.168.1.10')
+  assert.equal(n.server_port, 7890)
+  assert.equal(n.fields.username, undefined)
+  assert.equal(n.fields.password, undefined)
+})
+
+test('socks:// userinfo 是 base64 的 user:pass(v2rayN)', () => {
+  const b = Buffer.from('bob:pw123').toString('base64')
+  const n = parseShareLink(`socks://${b}@例子.com:1080#B`)
+  assert.equal(n.fields.username, 'bob')
+  assert.equal(n.fields.password, 'pw123')
+  assert.equal(n.server_port, 1080)
+})
+
+test('socks:// 整体 base64 的 user:pass@host:port(Shadowrocket)', () => {
+  const b = Buffer.from('carol:pw@5.6.7.8:1081').toString('base64')
+  const n = parseShareLink(`socks://${b}#C`)
+  assert.equal(n.fields.username, 'carol')
+  assert.equal(n.fields.password, 'pw')
+  assert.equal(n.server, '5.6.7.8')
+  assert.equal(n.server_port, 1081)
+})
+
+test('socks5h 当作 socks5;socks4 / socks4a 记下版本号', () => {
+  assert.equal(parseShareLink('socks5h://1.2.3.4:1080').fields.version, undefined)
+  assert.equal(parseShareLink('socks4://1.2.3.4:1080#D').fields.version, '4')
+  assert.equal(parseShareLink('socks4a://1.2.3.4:1080#E').fields.version, '4a')
+})
+
+test('socks5:// IPv6 主机', () => {
+  const n = parseShareLink('socks5://u:p@[2001:db8::1]:1080#v6')
+  assert.equal(n.server, '2001:db8::1')
+  assert.equal(n.server_port, 1080)
+  assert.equal(n.fields.username, 'u')
+})
+
+test('socks5:// 链接里的 sni / fp 一律忽略(内核这项没有 tls)', () => {
+  const n = parseShareLink('socks5://u:p@1.2.3.4:1080?sni=a.com&fp=chrome#F')
+  assert.equal(n.fields.tls, undefined)
+  assert.equal(n.fields.transport, undefined)
+  assert.equal(n.server_port, 1080)
+})
+
+test('分享链接没写 sni:vless / trojan 按 ws 的 host 兜底,vmess 按 host 字段兜底;写了 sni 的不变', () => {
+  const vless = parseShareLink('vless://22222222-2222-2222-2222-222222222222@104.16.1.1:443?encryption=none&security=tls&type=ws&path=%2Fvl&host=cdn.v.com#CF')
+  assert.equal(vless.fields.tls.server_name, 'cdn.v.com')
+  const vlessTcp = parseShareLink('vless://22222222-2222-2222-2222-222222222222@v.example.com:443?encryption=none&security=tls&type=tcp#T')
+  assert.equal(vlessTcp.fields.tls.server_name, 'v.example.com')            // 没 host 退到服务器地址(原有行为)
+  const trojan = parseShareLink('trojan://pw@104.16.1.3:443?type=ws&host=tj.example.com&path=%2Ft#TJ')
+  assert.equal(trojan.fields.tls.server_name, 'tj.example.com')
+  const vmess = parseShareLink(`vmess://${Buffer.from(JSON.stringify({ v: '2', ps: 'VM', add: '104.16.1.2', port: '443', id: '22222222-2222-2222-2222-222222222222', aid: '0', net: 'ws', host: 'cdn.vm.com', path: '/vm', tls: 'tls' })).toString('base64')}`)
+  assert.equal(vmess.fields.tls.server_name, 'cdn.vm.com')
+  const vmessSni = parseShareLink(`vmess://${Buffer.from(JSON.stringify({ v: '2', ps: 'VM', add: '104.16.1.2', port: '443', id: '22222222-2222-2222-2222-222222222222', aid: '0', net: 'ws', host: 'cdn.vm.com', sni: 'real.vm.com', tls: 'tls' })).toString('base64')}`)
+  assert.equal(vmessSni.fields.tls.server_name, 'real.vm.com')
+})
+
+test('ss:// 带 SIP003 插件:obfs-local / v2ray-plugin 带过去,内核没有的插件返回 null', () => {
+  const n = parseShareLink('ss://YWVzLTI1Ni1nY206c2VjcmV0cHc=@example.com:8388?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dwww.bing.com#混淆')
+  assert.equal(n.fields.plugin, 'obfs-local')
+  assert.equal(n.fields.plugin_opts, 'obfs=http;obfs-host=www.bing.com')
+  assert.equal(n.server, 'example.com')
+  const v = parseShareLink('ss://YWVzLTI1Ni1nY206c2VjcmV0cHc=@example.com:8388?plugin=v2ray-plugin%3Btls%3Bhost%3Dcdn.example.com#v2')
+  assert.equal(v.fields.plugin, 'v2ray-plugin')
+  assert.equal(v.fields.plugin_opts, 'tls;host=cdn.example.com')
+  assert.equal(parseShareLink('ss://YWVzLTI1Ni1nY206c2VjcmV0cHc=@example.com:8388?plugin=shadow-tls%3Bhost%3Dx#st'), null)
+})
+
+test('vless:// 的 flow=xtls-rprx-vision-udp443 归一成 vision,sid 为空不写 short_id', () => {
+  const n = parseShareLink('vless://22222222-2222-2222-2222-222222222222@v.example.com:443?encryption=none&security=reality&sni=v.example.com&pbk=PK&sid=&flow=xtls-rprx-vision-udp443&type=tcp#R')
+  assert.equal(n.fields.flow, 'xtls-rprx-vision')
+  assert.equal(n.fields.tls.reality.short_id, undefined)
+  assert.equal(n.fields.tls.reality.public_key, 'PK')
+})

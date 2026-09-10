@@ -107,13 +107,16 @@ export const readUpdateLogTail = async (ctx, paths, lines = 30) => {
   }
 }
 
-// 发起升级:update.sh 是 OpenWrt 专用脚本,在安卓端通过 SukiSU 刷机包升级,拦截在线覆盖以防破坏运行库。
+// 发起升级:update.sh --detach 自己 fork 到后台并立刻返回;真正的进度看状态文件。
 export const startUpdate = async (ctx, paths, channel = 'auto', { expect = '' } = {}) => {
-  return {
-    ok: false,
-    code: 1,
-    output: '当前运行于 Android (SukiSU Ultra) 环境。请在管理器中刷入新版 zip 模块进行升级，已禁用 OpenWrt 在线覆盖升级。',
-  }
+  const args = [paths.updateScript, '--detach']
+  if (channel === 'direct') args.push('--direct')
+  else if (channel === 'mirror') args.push('--mirror')
+  // 把探到的最新 tag 交给脚本:它据此下载带版本号的资产,并在解包后核对版本,
+  // 镜像缓存的旧包过不了这一关(见 update.sh 里 EXPECT_VERSION 的说明)
+  if (expect && /^[A-Za-z0-9._-]+$/.test(expect)) args.push('--expect', expect)
+  const r = await ctx.exec('sh', args, { timeoutMs: 20_000 })
+  return { ok: r.code === 0, code: r.code, output: `${r.stdout}${r.stderr}`.trim() }
 }
 
 export const cancelUpdate = async (ctx, paths) => {
@@ -254,6 +257,27 @@ export const refreshRulesets = async (ctx, paths, { fetchImpl = globalThis.fetch
     if (failed.some((f) => f.tag.startsWith(repo.prefix))) delete versions[repo.key]
   }
   return { updated, failed, total: entries.length, versions, source: src }
+}
+
+// 部署时 ensureRulesets 自动下载了规则集(新装机第一次启动、换来源):探一次上游版本记进 geo-update.json,
+// 让「当前版本」不再是「未知」。探不到就不写(留着「未知」比记一个错的强)。返回记下的版本表或 null
+export const recordGeoVersionsAfterDownload = async (ctx, paths, { fetchImpl = globalThis.fetch, downloaded = [], source = RULESET_SOURCE, timeoutMs = 8000 } = {}) => {
+  const { latest, via } = await checkGeoUpdate(ctx, paths, { fetchImpl, timeoutMs })
+  if (!latest || !Object.keys(latest).length || via === 'unknown') return null
+  const previous = await readJsonFile(ctx, paths.geoUpdateStatePath, {})
+  const record = {
+    ...previous,
+    lastAt: new Date().toISOString(),
+    updated: [...downloaded],
+    failed: [],
+    restarted: false,
+    trigger: 'deploy',
+    channel: previous.channel || 'auto',
+    versions: { ...(previous.source === source ? previous.versions || {} : {}), ...latest },
+    source,
+  }
+  await writeJsonFile(ctx, paths.geoUpdateStatePath, record)
+  return record.versions
 }
 
 export const readJsonFile = async (ctx, path, fallback = {}) => {

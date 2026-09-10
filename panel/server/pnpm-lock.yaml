@@ -2530,8 +2530,8 @@ packages:
     resolution: {integrity: sha512-VXJjc87FScF88uafS3JllDgvAm+c/Slfz06lorj2uAY34rlUu0Nt+v8wreiImcrgAjjIHp1rXpTDlLOGw29WwQ==}
     engines: {node: '>=18'}
 
-  open-box-panel@file:///Users/ange/Code/Open-Box/panel:
-    resolution: {directory: ../../../../../../../../Users/ange/Code/Open-Box/panel, type: directory}
+  open-box-panel@file:///private/tmp/openbox-release-v0.1.159-y11r96vx/source/panel:
+    resolution: {directory: ../../../../../../../../private/tmp/openbox-release-v0.1.159-y11r96vx/source/panel, type: directory}
 
   optionator@0.9.4:
     resolution: {integrity: sha512-6IpQ7mKUxRcZNLIObR0hz7lxsapSSIYNZJwXPGeF0mTVqGKFIXj1DQcMoT22S3ROcLyY/rz0PWaWZ9ayWmad9g==}
@@ -6159,7 +6159,7 @@ snapshots:
     dependencies:
       mimic-function: 5.0.1
 
-  open-box-panel@file:///Users/ange/Code/Open-Box/panel:
+  open-box-panel@file:///private/tmp/openbox-release-v0.1.159-y11r96vx/source/panel:
     dependencies:
       '@eslint/plugin-kit': 0.6.0
       '@fontsource/fira-sans': 5.2.7

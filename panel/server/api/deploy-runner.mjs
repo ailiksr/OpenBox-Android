@@ -1,14 +1,23 @@
+import { prepareDnsFilter, readFilterArtifact } from '../system/dns-filter.mjs'
+import { filterForwardPlan } from '../engine/dns-filter.mjs'
 import { randomBytes } from 'node:crypto'
+import { activeNodes } from './subscriptions.mjs'
 import { readSystemDns } from '../system/resolv.mjs'
+import { normalizeDnsRewrite, rewriteForwardDomains } from '../engine/dns-rewrite.mjs'
 import { readLocalSubnets } from '../system/local-subnets.mjs'
 import { resolveHostsToCidrs } from '../system/resolve-hosts.mjs'
 import { collectDirectHosts } from '../engine/direct-hosts.mjs'
-import { normalizeRouting } from '../engine/routing-model.mjs'
+import { bypassPlanKey, dnsmasqForwardPlan, nativeBypassPlan, normalizeRouting, policyClasses } from '../engine/routing-model.mjs'
+import { emitUserGroups } from '../engine/user-groups.mjs'
+import { normalizeClientRoutes } from '../engine/client-routes.mjs'
 import { builtinTags } from '../engine/user-groups.mjs'
 import { buildConfig } from '../engine/config.mjs'
 import { dnsPolicyClasses } from '../engine/dns.mjs'
 import { deployConfig, configMetaPath } from '../system/deploy.mjs'
 import { ensureRuleLists } from '../system/rule-lists.mjs'
+import { resolveNativeBypass } from '../system/native-bypass.mjs'
+import { dnsFakeIpEnabled, ipv6ProxyMode } from '../engine/dns.mjs'
+import { policyOutboundOptions } from '../engine/routing-model.mjs'
 import { enableService, disableService, serviceStatus } from '../system/service.mjs'
 import { CLASH_API_BASE } from './penetration.mjs'
 
@@ -99,6 +108,54 @@ export const dnsClassesFlipped = async (ctx, paths, store, selections) => {
   }
 }
 
+// 第一层的计划(入口原生旁路的集合、DNS 转发的三态)也是生成配置时按当时的选择定死的。只按 IP
+// 分流的站点集(geoip-cn → 直连)不进 DNS 分类表,代理页把它从直连切到代理时 dnsClassesFlipped
+// 看不出来,入口的 nft 集合还按旧的放行(复审 R3)。所以再比一次 config.meta.json 里的 firstLayer。
+export const firstLayerChanged = async (ctx, paths, store, selections) => {
+  try {
+    const meta = JSON.parse(await ctx.readFile(configMetaPath(paths)))
+    const prev = meta && meta.firstLayer
+    const members = meta && Array.isArray(meta.dnsPolicyMembers) ? meta.dnsPolicyMembers : []
+    if (!prev || typeof prev !== 'object' || !members.length) return false
+    const profile = store.getProfile() || {}
+    const builtin = builtinTags(typeof store.getGroups === 'function' ? store.getGroups() : [])
+    const dnsMode = (profile.dns && profile.dns.mode) || 'hijack'
+    const bypass = nativeBypassPlan(profile.routing, { members, builtin, selections: selections || {}, clientRoutes: normalizeClientRoutes(profile.clientRoutes, { directTag: builtin.direct }), fakeIp: dnsFakeIpEnabled(profile), dnsMode })
+    // 和元数据里计划阶段的结论比(pending 的重叠核对要到部署时才做)。指纹含候选集合、核对对象(名字 + 集合 +
+    // CIDR)和 FakeIP 前提——"核对对象从一条变成两条"这种变化只比站点集名字会漏掉(第四轮 T2)。老元数据没有
+    // 指纹就退回比集合 / pending 名字
+    if (typeof prev.nativeBypassPlanKey === 'string') {
+      if (prev.nativeBypassPlanKey !== bypassPlanKey(bypass)) return true
+    } else {
+      // 升级前写的元数据没有指纹:有 pending 的计划光比名字看不出核对对象的变化,宁可多重生成一次(之后的元数据
+      // 就带指纹了);没有 pending 的照旧比集合
+      const sortedSets = (v) => [...(Array.isArray(v) ? v : [])].sort().join('\n')
+      const planned = prev.nativeBypassPlanned || { sets: (prev.nativeBypass || {}).sets, pending: [] }
+      const pendingNames = (v) => [...(Array.isArray(v) ? v : [])].map((x) => (typeof x === 'string' ? x : x.policy)).sort().join('\n')
+      if (sortedSets(planned.sets) !== sortedSets(bypass.sets) || pendingNames(planned.pending) !== pendingNames(bypass.pending)) return true
+      if (bypass.pending.length || (Array.isArray(planned.pending) && planned.pending.length)) return true
+    }
+    // IPv6 分层 · 代理 v6 降为 IPv4:每条走代理的路由规则前面有一条 v6 拒绝,纯 IP 站点集在直连 / 代理之间
+    // 切换时 DNS 分类看不出来,但这条保护要跟着变(第四轮 T3)。按元数据里生成时的出口类别表比,只比两边
+    // 都有的名字(和 dnsClassesFlipped 一个道理)
+    if (prev.ipv6 === 'ipv4' && ipv6ProxyMode(profile) === 'ipv4') {
+      // 升级前的元数据没有出口类别表:不知道生成时的 v6 保护落在哪些站点集上,宁可多重生成一次
+      if (!prev.policyClasses || typeof prev.policyClasses !== 'object') return true
+      const next = policyClasses(profile.routing, members, builtin, selections || {})
+      if (Object.keys(next).some((k) => Object.prototype.hasOwnProperty.call(prev.policyClasses, k) && (prev.policyClasses[k] === 'proxy') !== (next[k] === 'proxy'))) return true
+    }
+    if (prev.dnsMode === 'dnsmasq') {
+      // 这里只能算到计划阶段(规则集要到部署时才展开),所以和元数据里计划阶段的模式比;老元数据
+      // 没有这个字段时退回和实际模式比
+      const forward = filterForwardPlan(profile, dnsmasqForwardPlan(profile.routing, members, builtin, selections || {}, { rewriteDomains: rewriteForwardDomains(normalizeDnsRewrite(profile.dns).rules) }))
+      if (forward.mode !== (prev.dnsForwardPlanned || prev.dnsForward)) return true
+    }
+    return false
+  } catch {
+    return false
+  }
+}
+
 // 内核在跑就用它此刻的选择并顺手存快照(同时按"选择即默认"写进档案);读不到(内核停着、
 // API 没起来)就退回上次的快照。
 export const resolveSelections = (store, live) => {
@@ -136,9 +193,36 @@ export const STATUS_BY_STAGE = {
 // systemDns 是路由器 WAN 下发的 DNS 上游(见 system/resolv.mjs):dnsmasq 接管模式下
 // 直连侧要用它,不能让 sing-box 去问系统解析器——那时系统解析器就是 dnsmasq,而 dnsmasq
 // 的上游又是 sing-box,一问就死循环。预览接口没有 ctx 也照样能出配置,回落到档案里的值。
-export const buildCurrentConfig = (store, systemDns, { cacheFilePath, selections, tlsCert, localSubnets = [], directHostCidrs = [], ruleLists = {} } = {}) => {
-  const profile = store.getProfile()
-  const nodes = store.getNodes()
+// profilePatch:在当前档案上临时盖一层再生成(不落库)。部署时 auto_redirect 起不来要降级
+// 重试就靠它把 tun.autoRedirect 关掉重生成一份(见 system/deploy.mjs)。
+// 当前档案 + 此刻的选择 → 旁路计划(纯函数那一步)。部署前和选择同步时都用它,口径一致
+export const currentBypassPlan = (store, selections) => {
+  const profile = store.getProfile() || {}
+  const groups = typeof store.getGroups === 'function' ? store.getGroups() : []
+  const builtin = builtinTags(groups)
+  const { publicTags } = emitUserGroups(groups, activeNodes(store), {})
+  const members = policyOutboundOptions(normalizeRouting(profile.routing).outboundOptions, publicTags, builtin)
+  return nativeBypassPlan(profile.routing, { members, builtin, selections: selections || {}, clientRoutes: normalizeClientRoutes(profile.clientRoutes, { directTag: builtin.direct }), fakeIp: dnsFakeIpEnabled(profile), dnsMode: (profile.dns && profile.dns.mode) || 'hijack' })
+}
+
+// 代理页改完出口之后的同步判断 + 执行:DNS 分类翻面、或第一层计划(入口旁路指纹 / DNS 转发三态 / v6 保护
+// 的出口类别)变了,就在后台重新生成配置并重启内核。index.mjs 的选择同步和开发路由器的运行时验收都走这
+// 一个入口,保证"判断变了"之后调用方真的执行了更新(第四轮 T2 / T3)
+export const regenerateIfPlanChanged = async ({ store, ctx, paths, selections, log = () => {}, deploy = runDeploy }) => {
+  const dnsFlipped = await dnsClassesFlipped(ctx, paths, store, selections)
+  const planChanged = dnsFlipped ? false : await firstLayerChanged(ctx, paths, store, selections)
+  if (!dnsFlipped && !planChanged) return { regenerated: false, reason: '' }
+  const reason = dnsFlipped ? '站点集在直连/代理之间翻面' : '第一层计划(入口旁路 / DNS 转发 / v6 保护)变了'
+  log(`[proxies] ${reason},后台重新生成配置`)
+  const result = await deploy({ store, ctx, paths })
+  if (!result.ok) log(`[proxies] 重新生成配置失败(${result.stage}):${result.message}`)
+  return { regenerated: true, reason, result }
+}
+
+export const buildCurrentConfig = (store, systemDns, { cacheFilePath, selections, tlsCert, localSubnets = [], directHostCidrs = [], ruleLists = {}, profilePatch, nativeBypass } = {}) => {
+  const profile = profilePatch ? { ...store.getProfile(), ...profilePatch } : store.getProfile()
+  // 停用的订阅的节点不进内核(api/subscriptions.mjs 的 activeNodes)
+  const nodes = activeNodes(store)
   const clashApiSecret = store.getClashSecret()
   const config = buildConfig({
     cacheFilePath,
@@ -155,8 +239,13 @@ export const buildCurrentConfig = (store, systemDns, { cacheFilePath, selections
     directHostCidrs,
     // 规则集链接的形状表:每条链接编成了域名 / IP 哪几份 .srs(见 system/rule-lists.mjs)
     ruleLists,
+    nativeBypass,
+    dnsFilter: readFilterArtifact(store),
   })
-  return { config, profile }
+  // 故障转移的运行映射(父组 / 页签 / 有效节点 / 子组 tag / 检测参数):和配置同一次生成,写进 config.meta.json
+  // 给后台管理器和界面用
+  const { failover } = emitUserGroups(store.getGroups(), nodes, { testUrl: profile.testUrl })
+  return { config, profile, failover }
 }
 
 // 「保存设置」与「让设置生效」之间只隔一次启动内核:各个设置页只管把自己那块写进档案,
@@ -167,7 +256,7 @@ export const buildCurrentConfig = (store, systemDns, { cacheFilePath, selections
 const resolveDirectHostCidrs = async (store, systemDns, lookup) => {
   const profile = store.getProfile()
   if (profile.directForNodes === false) return []
-  const { domains } = collectDirectHosts(store.getNodes(), store.getSubscriptions ? store.getSubscriptions() : [])
+  const { domains } = collectDirectHosts(activeNodes(store), store.getSubscriptions ? store.getSubscriptions() : [])
   return resolveHostsToCidrs(domains, lookup ? { lookup } : { servers: systemDns })
 }
 
@@ -261,9 +350,13 @@ export const runDeploy = (args) => {
 
 const CANCELLED = { ok: false, stage: 'cancelled', message: '部署被「停止」取消,没有改动系统', badTags: [] }
 
-const runDeployInner = async ({ store, ctx, paths, fetchImpl = globalThis.fetch, lookup, isCancelled = () => false }) => {
+// 每次部署一个序号:后台盯晚崩溃的那段发现已经有新的部署开始就退出,不和它抢
+let deploySerial = 0
+
+const runDeployInner = async ({ store, ctx, paths, fetchImpl = globalThis.fetch, lookup, isCancelled = () => false, lateWatch = true, refreshDnsFilter = false }) => {
   let result
   const startedAt = Date.now()
+  const serial = ++deploySerial
   try {
     if (isCancelled()) {
       store.setDeployState({ stage: CANCELLED.stage, message: CANCELLED.message, at: Date.now(), badTags: [] })
@@ -272,6 +365,7 @@ const runDeployInner = async ({ store, ctx, paths, fetchImpl = globalThis.fetch,
     const [systemDns, localSubnets] = await Promise.all([readSystemDns(ctx), readLocalSubnets(ctx)])
     const directHostCidrs = await resolveDirectHostCidrs(store, systemDns, lookup)
     const selections = resolveSelections(store, await fetchSelections(fetchImpl, store.getClashSecret()))
+    await prepareDnsFilter({ store, ctx, paths, force: refreshDnsFilter })
     // 规则集链接要排在生成配置之前:拉回来才知道每条名单编成了域名 / IP 哪几份 .srs,
     // 路由规则和 DNS 规则要凭这个决定引用哪几份(见 engine/routing-model.mjs)。
     // 这一步只往 rulesetDir 里写文件,失败原地返回,不动系统。
@@ -279,24 +373,44 @@ const runDeployInner = async ({ store, ctx, paths, fetchImpl = globalThis.fetch,
     if (!ruleLists.ok) {
       result = { ok: false, stage: 'rulesets', message: ruleLists.message }
     } else {
-      const { config, profile } = buildCurrentConfig(store, systemDns, {
+      // 入口原生旁路:纯函数先算,FakeIP 下留下的 pending 在这里解码两边的集合核对重叠(system/native-bypass.mjs),
+      // 生成配置和元数据用同一份结论
+      const nativeBypass = await resolveNativeBypass(ctx, paths, currentBypassPlan(store, selections))
+      const buildOptions = {
         cacheFilePath: paths.cacheDb, selections, tlsCert: { certPath: paths.tlsCert, keyPath: paths.tlsKey }, localSubnets, directHostCidrs,
-        ruleLists: ruleLists.lists,
-      })
+        ruleLists: ruleLists.lists, nativeBypass,
+      }
+      const { config, profile, failover } = buildCurrentConfig(store, systemDns, buildOptions)
       const prepMs = Date.now() - startedAt
-      result = await deployConfig(ctx, paths, { config, profile, userGroups: store.getGroups(), selections, isCancelled })
+      result = await deployConfig(ctx, paths, {
+        config, profile, userGroups: store.getGroups(), selections, isCancelled, nativeBypass, failover,
+        rebuild: (profilePatch) => buildCurrentConfig(store, systemDns, { ...buildOptions, profilePatch }).config,
+      })
+      if (result.warning) console.warn(`[deploy] ${result.warning}`)
       // 准备阶段 = 读系统 DNS / 解析节点域名 / 拉当前选择 / 规则集链接 / 生成配置
       result.timings = { 准备: prepMs, ...(result.timings || {}) }
     }
     store.setDeployState({
       stage: result.stage,
-      message: result.message || '',
+      // 成功但降过级(auto_redirect 起不来改纯 tun)的,把降级原因当消息存着,诊断包里能看到
+      message: result.message || result.warning || '',
       at: Date.now(),
       badTags: result.badTags || [],
     })
     // 部署多久,日志里直接能看到——用户反馈「重启要一分钟」时不用猜
     const steps = Object.entries(result.timings || {}).map(([k, v]) => `${k} ${(v / 1000).toFixed(1)}`).join(' · ')
     console.log(`[deploy] ${result.ok ? '完成' : `失败(${result.stage})`},耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s${steps ? `(${steps})` : ''}`)
+    // 确认在跑之后再在后台盯两眼(GitHub #4:nft 那步在第 5 秒才崩,确认时还活着):崩了就降级 / 回滚并把结果写进部署状态
+    if (result.ok && lateWatch && typeof result.lateCrashWatch === 'function') {
+      const watch = result.lateCrashWatch
+      watch({ isStale: () => serial !== deploySerial }).then(async (late) => {
+        if (!late) return
+        store.setDeployState({ stage: late.stage, message: late.message || late.warning || '', at: Date.now(), badTags: [] })
+        console[late.ok ? 'warn' : 'error'](`[deploy] 内核在确认后崩溃:${late.message || late.warning}`)
+        if (!late.ok) await disableService(ctx, paths.initd.core).catch(() => {})
+      }).catch((err) => console.warn('[deploy] late crash watch failed:', err instanceof Error ? err.message : err))
+    }
+    delete result.lateCrashWatch
   } catch (error) {
     // deployConfig 只在"落盘"之后的步骤自行 try/catch;冲突检测(detectConflicts)、
     // mkdirp、validateConfigObject 这些落盘之前的步骤抛出的异常会冒泡到这里。不兜底的话

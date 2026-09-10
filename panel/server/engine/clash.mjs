@@ -1,4 +1,5 @@
 import YAML from 'yaml'
+import { clashSsPlugin, normalizeRealityShortId, normalizeVlessFlow } from './node-fields.mjs'
 import { createNode } from './node-model.mjs'
 
 const toArray = (v) => (Array.isArray(v) ? v : v == null ? [] : [v])
@@ -28,10 +29,13 @@ const buildClashTransport = (p) => {
   return transport
 }
 
-const buildClashTls = (p) => {
+// SNI 没写时按 ws / h2 的 Host 头兜底:CF 优选这类 server 填的是 IP、只在 Host 里写域名的节点,
+// Clash / mihomo 就是这么连的;sing-box 遇到 IP 不发 SNI,CF 直接拒绝握手(GitHub #3 #9)
+const hostHeader = (transport) => (transport && transport.headers && transport.headers.Host) || ''
+const buildClashTls = (p, transport) => {
   if (!p.tls && !p.sni && !p.servername && !p['reality-opts']) return undefined
   const tls = { enabled: p.tls === true || !!p['reality-opts'] }
-  const sni = p.servername || p.sni
+  const sni = p.servername || p.sni || hostHeader(transport)
   if (sni) tls.server_name = sni
   if (p.alpn) tls.alpn = toArray(p.alpn)
   if (p['skip-cert-verify'] === true) tls.insecure = true
@@ -40,7 +44,8 @@ const buildClashTls = (p) => {
     const ro = p['reality-opts']
     tls.reality = { enabled: true }
     if (ro['public-key']) tls.reality.public_key = ro['public-key']
-    if (ro['short-id'] !== undefined) tls.reality.short_id = String(ro['short-id'])
+    const sid = normalizeRealityShortId(ro['short-id'])
+    if (sid !== undefined) tls.reality.short_id = sid
     if (!tls.utls) tls.utls = { enabled: true, fingerprint: 'chrome' }
   }
   if (!tls.enabled) return undefined
@@ -49,33 +54,47 @@ const buildClashTls = (p) => {
 
 const MAPPERS = {
   ss: (p) => {
-    if (p.plugin) throw new Error('ss plugin unsupported')
-    return { type: 'shadowsocks', fields: { method: p.cipher, password: p.password } }
+    const fields = { method: p.cipher, password: p.password }
+    // obfs / v2ray-plugin 内核支持,按 SIP003 写法带过去;别的插件抛 UnsupportedPluginError 记进 skipped
+    if (p.plugin) Object.assign(fields, clashSsPlugin(p.plugin, p['plugin-opts']))
+    return { type: 'shadowsocks', fields }
   },
-  vmess: (p) => ({
-    type: 'vmess',
-    fields: {
-      uuid: p.uuid, alter_id: Number.parseInt(p.alterId ?? 0, 10) || 0, security: p.cipher || 'auto',
-      ...(buildClashTransport(p) ? { transport: buildClashTransport(p) } : {}),
-      ...(buildClashTls(p) ? { tls: buildClashTls(p) } : {}),
-    },
-  }),
-  vless: (p) => ({
-    type: 'vless',
-    fields: {
-      uuid: p.uuid, ...(p.flow ? { flow: p.flow } : {}),
-      ...(buildClashTransport(p) ? { transport: buildClashTransport(p) } : {}),
-      ...(buildClashTls(p) ? { tls: buildClashTls(p) } : {}),
-    },
-  }),
-  trojan: (p) => ({
-    type: 'trojan',
-    fields: {
-      password: p.password,
-      ...(buildClashTransport(p) ? { transport: buildClashTransport(p) } : {}),
-      tls: buildClashTls(p) || { enabled: true, ...(p.sni ? { server_name: p.sni } : {}) },
-    },
-  }),
+  vmess: (p) => {
+    const transport = buildClashTransport(p)
+    const tls = buildClashTls(p, transport)
+    return {
+      type: 'vmess',
+      fields: {
+        uuid: p.uuid, alter_id: Number.parseInt(p.alterId ?? 0, 10) || 0, security: p.cipher || 'auto',
+        ...(transport ? { transport } : {}),
+        ...(tls ? { tls } : {}),
+      },
+    }
+  },
+  vless: (p) => {
+    const transport = buildClashTransport(p)
+    const tls = buildClashTls(p, transport)
+    return {
+      type: 'vless',
+      fields: {
+        uuid: p.uuid, ...(normalizeVlessFlow(p.flow) ? { flow: normalizeVlessFlow(p.flow) } : {}),
+        ...(transport ? { transport } : {}),
+        ...(tls ? { tls } : {}),
+      },
+    }
+  },
+  trojan: (p) => {
+    const transport = buildClashTransport(p)
+    const sni = p.sni || hostHeader(transport)
+    return {
+      type: 'trojan',
+      fields: {
+        password: p.password,
+        ...(transport ? { transport } : {}),
+        tls: buildClashTls(p, transport) || { enabled: true, ...(sni ? { server_name: sni } : {}) },
+      },
+    }
+  },
   hysteria2: (p) => ({
     type: 'hysteria2',
     fields: {
@@ -105,6 +124,18 @@ const MAPPERS = {
       tls: buildClashTls({ ...p, tls: true }) || { enabled: true },
     },
   }),
+  // Clash 的 socks5。sing-box 的 socks 出站没有 TLS 可配,带 tls: true 的条目照搬过去
+  // 只会连不上,这里直接抛出去记成 skipped,让用户知道这条没被收进来。
+  socks5: (p) => {
+    if (p.tls === true) throw new Error('socks5 over tls unsupported')
+    return {
+      type: 'socks',
+      fields: {
+        ...(p.username ? { username: String(p.username) } : {}),
+        ...(p.password ? { password: String(p.password) } : {}),
+      },
+    }
+  },
   wireguard: (p) => ({
     type: 'wireguard',
     fields: {
@@ -117,7 +148,7 @@ const MAPPERS = {
 
 // YAML 里不加引号的纯数字密码(password: 12345678)会被解析成 number,原样写进配置内核
 // 报 cannot unmarshal number into string,整份部署失败。凡是内核要字符串的字段这里统一转成字符串。
-const STRING_FIELDS = ['password', 'uuid', 'cipher', 'obfs-password', 'auth-str', 'auth_str', 'private-key', 'public-key', 'preshared-key', 'servername', 'sni', 'flow']
+const STRING_FIELDS = ['username', 'password', 'uuid', 'cipher', 'obfs-password', 'auth-str', 'auth_str', 'private-key', 'public-key', 'preshared-key', 'servername', 'sni', 'flow']
 const normalizeProxy = (p) => {
   const out = { ...p }
   for (const k of STRING_FIELDS) {
@@ -140,14 +171,16 @@ export const parseClashProxies = (yamlText) => {
     if (!p || typeof p !== 'object') continue
     const mapper = MAPPERS[p.type]
     if (!mapper) {
-      skipped.push({ name: p.name, type: p.type })
+      skipped.push({ name: p.name, type: p.type, reason: 'unsupported-type' })
       continue
     }
     try {
       const { type, fields } = mapper(normalizeProxy(p))
       nodes.push(createNode({ tag: p.name, type, server: p.server, server_port: p.port, fields, source: 'clash' }))
-    } catch {
-      skipped.push({ name: p.name, type: p.type })
+    } catch (err) {
+      // 跳过要说清为什么:不支持的插件(shadow-tls 这类)/ 字段不合法,界面照原因显示
+      const code = err && err.code === 'unsupported-plugin' ? 'unsupported-plugin' : 'invalid'
+      skipped.push({ name: p.name, type: p.type, reason: code, detail: (err && (err.detail || err.message)) || '' })
     }
   }
   return { nodes, skipped }

@@ -1,7 +1,8 @@
 import { createNode } from './node-model.mjs'
+import { normalizeRealityShortId, normalizeVlessFlow, sip003Plugin } from './node-fields.mjs'
 import { decodeBase64, parseUri } from './codec.mjs'
 
-export const SHARELINK_SCHEMES = ['ss', 'vmess', 'vless', 'trojan', 'hysteria2', 'tuic', 'anytls']
+export const SHARELINK_SCHEMES = ['ss', 'vmess', 'vless', 'trojan', 'hysteria2', 'tuic', 'anytls', 'socks', 'socks5']
 
 // decodeURIComponent 失败(非法 % 序列)时回退原值,而不是抛异常
 const safeDecode = (s) => {
@@ -38,8 +39,17 @@ const parseSs = (uri) => {
     fragment = decodeURIComponent(rest.slice(hashIdx + 1))
     rest = rest.slice(0, hashIdx)
   }
+  // SIP002 的 plugin= 参数(obfs-local / v2ray-plugin 内核支持);内核没有的插件返回 null 当作认不出
+  let plugin
   const qIdx = rest.indexOf('?')
-  if (qIdx >= 0) rest = rest.slice(0, qIdx) // 忽略 plugin 参数(P2a 不做插件)
+  if (qIdx >= 0) {
+    try {
+      plugin = sip003Plugin(new URLSearchParams(rest.slice(qIdx + 1)).get('plugin'))
+    } catch {
+      return null
+    }
+    rest = rest.slice(0, qIdx)
+  }
 
   let method, password, server, port
   if (rest.includes('@')) {
@@ -75,7 +85,7 @@ const parseSs = (uri) => {
   }
   return createNode({
     tag: fragment, type: 'shadowsocks', server, server_port: port,
-    fields: { method, password }, source: 'sharelink',
+    fields: { method, password, ...(plugin || {}) }, source: 'sharelink',
   })
 }
 
@@ -103,7 +113,9 @@ const parseVmess = (uri) => {
   }
   if (conf.tls === 'tls' || conf.tls === 'reality') {
     fields.tls = { enabled: true }
-    if (conf.sni) fields.tls.server_name = conf.sni
+    // sni 没写按 ws / h2 的 host 兜底(v2rayN 也这么做):CF 优选的 add 是 IP,域名只在 host 里
+    const sni = conf.sni || (net !== 'tcp' && conf.host) || ''
+    if (sni) fields.tls.server_name = sni
   }
   return createNode({
     tag: conf.ps || '', type: 'vmess', server: conf.add, server_port: conf.port,
@@ -129,6 +141,9 @@ const buildTransportFromQuery = (query) => {
   return transport
 }
 
+// SNI 的兜底顺序:ws / h2 的 Host 头 → 服务器地址。只有 Host 是域名时才用它
+const sniFallback = (transport, host) => (transport && transport.headers && transport.headers.Host) || host
+
 const buildTlsFromQuery = (query, fallbackSni) => {
   const security = query.get('security')
   if (security !== 'tls' && security !== 'reality' && security !== 'xtls') return undefined
@@ -144,8 +159,8 @@ const buildTlsFromQuery = (query, fallbackSni) => {
     tls.reality = { enabled: true }
     const pbk = query.get('pbk')
     if (pbk) tls.reality.public_key = pbk
-    const sid = query.get('sid')
-    if (sid) tls.reality.short_id = sid
+    const sid = normalizeRealityShortId(query.get('sid'))
+    if (sid !== undefined) tls.reality.short_id = sid
     if (!tls.utls) tls.utls = { enabled: true, fingerprint: 'chrome' }  // reality 需要 utls
   }
   return tls
@@ -154,11 +169,12 @@ const buildTlsFromQuery = (query, fallbackSni) => {
 const parseVless = (uri) => {
   const u = parseUri(uri)
   const fields = { uuid: safeDecode(u.userinfo) }
-  const flow = u.query.get('flow')
+  const flow = normalizeVlessFlow(u.query.get('flow'))
   if (flow) fields.flow = flow
   const transport = buildTransportFromQuery(u.query)
   if (transport) fields.transport = transport
-  const tls = buildTlsFromQuery(u.query, u.host)
+  // sni 没写时先按 ws / h2 的 host 兜底,再退到服务器地址:CF 优选的服务器是 IP,域名只在 host 里
+  const tls = buildTlsFromQuery(u.query, sniFallback(transport, u.host))
   if (tls) fields.tls = tls
   return createNode({ tag: u.fragment, type: 'vless', server: u.host, server_port: u.port, fields, source: 'sharelink' })
 }
@@ -170,7 +186,8 @@ const parseTrojan = (uri) => {
   if (transport) fields.transport = transport
   // trojan 默认走 TLS;security 缺省也视为 tls,以便 insecure/reality/utls 等 tls 字段仍被采集
   if (!u.query.get('security')) u.query.set('security', 'tls')
-  const tls = buildTlsFromQuery(u.query, u.host) || { enabled: true, ...(u.host ? { server_name: u.host } : {}) }
+  const fallback = sniFallback(transport, u.host)
+  const tls = buildTlsFromQuery(u.query, fallback) || { enabled: true, ...(fallback ? { server_name: fallback } : {}) }
   fields.tls = tls
   return createNode({ tag: u.fragment, type: 'trojan', server: u.host, server_port: u.port, fields, source: 'sharelink' })
 }
@@ -221,6 +238,58 @@ const parseTuic = (uri) => {
   return createNode({ tag: u.fragment, type: 'tuic', server: u.host, server_port: u.port, fields, source: 'sharelink' })
 }
 
+// socks5://user:pass@host:port#name  /  socks5://host:port#name(不要认证)
+// socks://<base64(user:pass)>@host:port#name(v2rayN)
+// socks://<base64(user:pass@host:port)>#name(Shadowrocket)
+// socks4:// 与 socks4a:// 走同一套,只是把版本号记下来。
+// sing-box 的 socks 出站没有 TLS、也没有传输层可配,所以这里只取版本和账号密码,
+// 链接里带的 sni / fp 之类一律忽略——写进去内核会以 unknown field 拒收整份配置。
+const parseSocks = (uri, version) => {
+  let rest = uri.slice(uri.indexOf('://') + 3)
+  let fragment = ''
+  const hashIdx = rest.indexOf('#')
+  if (hashIdx >= 0) {
+    fragment = safeDecode(rest.slice(hashIdx + 1))
+    rest = rest.slice(0, hashIdx)
+  }
+  const qIdx = rest.indexOf('?')
+  if (qIdx >= 0) rest = rest.slice(0, qIdx)
+
+  let creds = ''
+  let hostport = rest
+  if (rest.includes('@')) {
+    const at = rest.lastIndexOf('@')
+    const userinfo = rest.slice(0, at)
+    hostport = rest.slice(at + 1)
+    const plain = safeDecode(userinfo)
+    if (plain.includes(':')) {
+      creds = plain
+    } else {
+      // 明文里没有 ':' 才当 base64 试;解不出可打印的 user:pass 就按明文用户名处理
+      const decoded = decodeBase64(userinfo)
+      creds = isPrintable(decoded) && decoded.includes(':') ? decoded : plain
+    }
+  } else if (!rest.includes(':')) {
+    // host:port 一定带 ':',没有 ':' 才可能是整体 base64(base64 字母表里没有 ':')
+    const decoded = decodeBase64(rest)
+    if (!isPrintable(decoded)) return null
+    const at = decoded.lastIndexOf('@')
+    creds = at >= 0 ? decoded.slice(0, at) : ''
+    hostport = at >= 0 ? decoded.slice(at + 1) : decoded
+  }
+
+  const [server, port] = splitHostPort(hostport)
+  const fields = {}
+  if (creds) {
+    const ci = creds.indexOf(':')
+    fields.username = ci >= 0 ? creds.slice(0, ci) : creds
+    if (ci >= 0) fields.password = creds.slice(ci + 1)
+  }
+  // 内核默认就是 5,只有 4 / 4a 需要写出来
+  if (version && version !== '5') fields.version = version
+  return createNode({ tag: fragment, type: 'socks', server, server_port: port, fields, source: 'sharelink' })
+}
+
 export const parseShareLink = (uri) => {
   if (typeof uri !== 'string') return null
   try {
@@ -232,6 +301,12 @@ export const parseShareLink = (uri) => {
     if (uri.startsWith('hy2://')) return parseHysteria2('hysteria2://' + uri.slice('hy2://'.length))
     if (uri.startsWith('tuic://')) return parseTuic(uri)
     if (uri.startsWith('anytls://')) return parseAnytls(uri)
+    // socks5h 是 curl 的写法(DNS 也走代理),对出站来说和 socks5 没区别
+    if (uri.startsWith('socks5://')) return parseSocks(uri, '5')
+    if (uri.startsWith('socks5h://')) return parseSocks(uri, '5')
+    if (uri.startsWith('socks4a://')) return parseSocks(uri, '4a')
+    if (uri.startsWith('socks4://')) return parseSocks(uri, '4')
+    if (uri.startsWith('socks://')) return parseSocks(uri, '5')
     return null
   } catch {
     return null

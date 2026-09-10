@@ -1,51 +1,62 @@
+// dnsmasq 转发模式下对路由器 dnsmasq 的接管:按第一层的 DNS 计划(engine/routing-model.mjs 的
+// dnsmasqForwardPlan → system/dns-forward.mjs 展开)把 dnsmasq 改成三种形态之一:
+//   none     一个域名都不转发:原 DNS 原样(接管过就还原)
+//   domains  原 DNS 基线原样(用户的上游、定向域名上游、noresolv 都保留)+ 一份转发文件放进 dnsmasq 的
+//            conf-dir(server=/域名/127.0.0.1#7853,一行一条,几千条也只是一个文件;uci 列表不放
+//            我们的条目)
+//   all      上游只剩内核、noresolv=1:所有查询都进内核再分
+// 三个持久化文件(都在 data/ 下):
+//   dnsmasq-backup.txt    接管前用户的 DNS 设置(uci show 形态),还原 / stop 的依据——它是"用户基线"
+//   dnsmasq-takeover.txt  这次写了什么:第一行 plan=,后面 server= / forward= / noresolv=1,init 脚本开机照抄
+//   dnsmasq-forward.conf  domains 的转发条目 + DNS 重写的 rebind 例外(all 也可能有例外),开机重放
+import { dnsmasqSafeDomain } from '../engine/dns-names.mjs'
+import { normalizeDomain } from '../engine/dns-rewrite.mjs'
+import { forwardConfText } from './dns-forward.mjs'
+
+export { dnsmasqSafeDomain }
+
 const BACKUP_NAME = 'dnsmasq-backup.txt'
-// 这次接管往 dnsmasq 写了什么(server 列表 + 是否 noresolv),给 init 脚本开机时照抄:
 // 干净重启时 K10 stop 会把接管还原,开机 S99 只拉内核不接管,dnsmasq 走运营商上游又被
 // 内核的 nft 劫持回来,打环到全 LAN 无解析、内核内存冲到几百 MB(2026-09-04 正式路由器)。
+// 所以开机要照抄状态文件重新接管。
 const STATE_NAME = 'dnsmasq-takeover.txt'
+const FORWARD_NAME = 'dnsmasq-forward.conf'
+// 放进 dnsmasq conf-dir 的文件名(init 脚本 DNSMASQ_FORWARD_CONF 与之一致)
+export const DNS_FORWARD_CONF_NAME = 'open-box.conf'
 const SINGBOX_DNS_UPSTREAM = '127.0.0.1#7853'
 
 export const dnsTakeoverBackupPath = (paths) => `${paths.dataDir}/${BACKUP_NAME}`
 export const dnsTakeoverStatePath = (paths) => `${paths.dataDir}/${STATE_NAME}`
+export const dnsForwardFilePath = (paths) => `${paths.dataDir}/${FORWARD_NAME}`
 const backupPath = dnsTakeoverBackupPath
 
+// dnsmasq 读的 conf-dir:uci 里设了 confdir 就用它(逗号后面是过滤规则,去掉),没设按 OpenWrt 的
+// dnsmasq 初始化脚本的默认:/tmp/dnsmasq.<段名>.d(段名从 uci show 第一行取)
+export const dnsmasqConfDir = async (ctx) => {
+  const set = String((await ctx.exec('uci', ['-q', 'get', 'dhcp.@dnsmasq[0].confdir'])).stdout || '').trim().split(',')[0]
+  if (set && set.startsWith('/')) return set
+  const m = /^dhcp\.([^.=\s]+)=dnsmasq/m.exec(String((await ctx.exec('uci', ['-q', 'show', 'dhcp.@dnsmasq[0]'])).stdout || ''))
+  return `/tmp/dnsmasq${m ? `.${m[1]}` : ''}.d`
+}
+const installedForwardPath = async (ctx) => `${await dnsmasqConfDir(ctx)}/${DNS_FORWARD_CONF_NAME}`
+
+// 备份(uci show 形态)→ { servers, noresolv }。list 型选项在 `uci show` 里同一行以空格分隔、
+// 逐个加引号:dhcp.cfg.server='1.1.1.1' '8.8.8.8' —— 必须把 '=' 之后的所有引号组都取出
 const parseBackup = (text) => {
   const servers = []
   let noresolv = null
   for (const line of String(text || '').split('\n')) {
-    // list 型选项(如多个上游 server)在 `uci show` 里同一行以空格分隔、逐个加引号:
-    // dhcp.cfg.server='1.1.1.1' '8.8.8.8' —— 必须把 '=' 之后的所有引号组都取出,
-    // 否则只拿到第一个上游,其余在还原时静默丢失。
     const idx = line.indexOf('.server=')
     if (idx !== -1) {
       const rhs = line.slice(idx + '.server='.length)
       const quoted = [...rhs.matchAll(/'([^']*)'/g)].map((m) => m[1])
-      if (quoted.length) {
-        servers.push(...quoted)
-      } else if (rhs.trim()) {
-        servers.push(rhs.trim())
-      }
+      if (quoted.length) servers.push(...quoted)
+      else if (rhs.trim()) servers.push(rhs.trim())
     }
     const n = line.match(/\.noresolv='?([^'\n]+)'?/)
     if (n) noresolv = n[1]
   }
   return { servers, noresolv }
-}
-
-// forwardDomains 非空 = 只把这几个域名转给 sing-box,其余交给路由器原有上游自己解析
-// ——这才是"直连的 DNS 完全不经过 Open-Box"。它只在代理面能被逐条列出来时才成立,
-// 由 engine/routing-model.mjs 的 dnsmasqForwardDomains 判断;列不出来就传空数组,
-// 回落到把整个上游指向 sing-box 的老做法。
-// 能安全写进 dnsmasq `server=/域名/` 的域名:ASCII 主机名(dnsmasq 不带 IDN,非 ASCII、
-// 超长标签、控制字符会让它 "bad domain in --server" 拒绝启动 → 全 LAN 断 DNS 和 DHCP);
-// `#` `/` 之类还会改变语义(`/#/` = 匹配全部)。前面的 `*.` / `.` 是用户写后缀的习惯,去掉。
-const DNS_LABEL = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/i
-export const dnsmasqSafeDomain = (raw) => {
-  const d = String(raw || '').trim().toLowerCase().replace(/^\*\./, '').replace(/^\.+/, '').replace(/\.+$/, '')
-  if (!d || d.length > 253) return null
-  const labels = d.split('.')
-  if (!labels.every((l) => DNS_LABEL.test(l))) return null
-  return d
 }
 
 // 必须成功的命令:退出码非零就抛,stderr 带出去。uci 的 delete / del_list 不走这里——目标本来
@@ -56,83 +67,213 @@ const must = async (ctx, cmd, args, what) => {
   return r
 }
 
-const listOurEntries = async (ctx) => {
+const isOurs = (v) => typeof v === 'string' && v.endsWith(SINGBOX_DNS_UPSTREAM)
+
+// uci 里此刻的 dnsmasq 上游列表和 noresolv
+const readCurrent = async (ctx) => {
   const { stdout } = await ctx.exec('uci', ['-q', 'get', 'dhcp.@dnsmasq[0].server'])
-  return String(stdout || '').split(/\s+/).filter((v) => v && v.endsWith(SINGBOX_DNS_UPSTREAM))
+  const servers = String(stdout || '').split(/\s+/).filter(Boolean)
+  const nr = String((await ctx.exec('uci', ['-q', 'get', 'dhcp.@dnsmasq[0].noresolv'])).stdout || '').trim()
+  return { servers, noresolv: nr === '1' ? '1' : nr === '' ? null : nr }
 }
 
-export const applyDnsTakeover = async (ctx, paths, { mode, forwardDomains = [] } = {}) => {
-  const check = await ctx.exec('which', ['uci'])
-  if (check.code !== 0) return { changed: false, actions: [] }
-  if (mode !== 'dnsmasq') return { changed: false, actions: [] }
-
-  if (!(await ctx.exists(backupPath(paths)))) {
-    const { stdout } = await ctx.exec('uci', ['show', 'dhcp.@dnsmasq[0]'])
-    await ctx.mkdirp(paths.dataDir)
-    await ctx.writeFile(backupPath(paths), stdout)
+// 上次写的状态(plan 等);没有就是空对象
+const readState = async (ctx, paths) => {
+  const sp = dnsTakeoverStatePath(paths)
+  if (!(await ctx.exists(sp))) return {}
+  const out = { servers: [] }
+  for (const line of String(await ctx.readFile(sp)).split('\n')) {
+    if (line.startsWith('plan=')) out.plan = line.slice(5)
+    else if (line.startsWith('server=')) out.servers.push(line.slice(7))
+    else if (line.startsWith('forward=')) out.forward = line.slice(8)
+    else if (line === 'noresolv=1') out.noresolv = '1'
   }
-
-  const wanted = Array.isArray(forwardDomains) ? forwardDomains : []
-  const safeDomains = [...new Set(wanted.map(dnsmasqSafeDomain).filter(Boolean))]
-  // 有一个域名写不进 dnsmasq 就整体回落全局转发:少转发一个域名 = 那个站点走代理却在本地
-  // 解析(拿到污染 IP),比起让 dnsmasq 起不来仍是小得多的代价
-  const badDomain = wanted.length > 0 && wanted.some((d) => !dnsmasqSafeDomain(d))
-  const perDomain = wanted.length > 0 && !badDomain
-  const servers = perDomain
-    ? safeDomains.map((domain) => `/${domain}/${SINGBOX_DNS_UPSTREAM}`)
-    : [SINGBOX_DNS_UPSTREAM]
-  const stateText = [...servers.map((s) => `server=${s}`), ...(perDomain ? [] : ['noresolv=1'])].join('\n') + '\n'
-
-  // 已经是目标状态就一个字不动:每次部署都 commit + 重启 dnsmasq,是一次全 LAN 解析瞬断外加
-  // 三秒多的等待(实测),而绝大多数部署 DNS 这块根本没变。和 init 脚本里的幂等判断一样,
-  // 只看我们自己写的条目和 noresolv。
-  const ours = await listOurEntries(ctx)
-  const currentNoresolv = String((await ctx.exec('uci', ['-q', 'get', 'dhcp.@dnsmasq[0].noresolv'])).stdout || '').trim() === '1'
-  const sameServers = ours.length === servers.length && [...ours].sort().join('\n') === [...servers].sort().join('\n')
-  if (sameServers && currentNoresolv === !perDomain) {
-    await ctx.writeFile(dnsTakeoverStatePath(paths), stateText)
-    return { changed: false, actions: ['unchanged'] }
-  }
-  if (perDomain) {
-    // 只摘掉我们自己上一次写的条目,用户的上游(AdGuard / 223.5.5.5 …)原样保留——
-    // "其余域名交回路由器自己的上游"说的就是它们。也不设 noresolv,反而要把可能残留的
-    // 那条删掉,否则上一次全局接管留下的 noresolv=1 会让"没被转发的域名"彻底无解析。
-    for (const entry of await listOurEntries(ctx)) {
-      await ctx.exec('uci', ['-q', 'del_list', `dhcp.@dnsmasq[0].server=${entry}`])
-    }
-    await ctx.exec('uci', ['-q', 'delete', 'dhcp.@dnsmasq[0].noresolv'])
-  } else {
-    await ctx.exec('uci', ['-q', 'delete', 'dhcp.@dnsmasq[0].server'])
-    await must(ctx, 'uci', ['set', 'dhcp.@dnsmasq[0].noresolv=1'], 'uci set noresolv')
-  }
-  for (const s of servers) await must(ctx, 'uci', ['add_list', `dhcp.@dnsmasq[0].server=${s}`], `uci add_list server=${s}`)
-  // 闪存写满时 commit 静默失败,dnsmasq 重启后还是旧配置;dnsmasq 起不来 LAN 就没 DNS——
-  // 两种都不能报"部署成功"
-  await must(ctx, 'uci', ['commit', 'dhcp'], 'uci commit dhcp')
-  await must(ctx, '/etc/init.d/dnsmasq', ['restart'], 'dnsmasq 重启')
-  // 放在 commit 之后能保证"状态文件存在 ⇒ uci 已经写过"
-  await ctx.writeFile(dnsTakeoverStatePath(paths), stateText)
-  return {
-    changed: true,
-    actions: ['backup', perDomain ? 'set-per-domain' : badDomain ? 'set-upstream:bad-domain' : 'set-upstream', 'restart-dnsmasq'],
-  }
+  return out
 }
 
-export const restoreDnsTakeover = async (ctx, paths) => {
-  const check = await ctx.exec('which', ['uci'])
-  if (check.code !== 0) return { restored: true }
+// 用户基线(接管前 / 用户后来改成的 DNS 设置)的归属规则(复审 S2):
+//   上次是 all      uci 里看不到用户的上游(all 把它们删了),只能看到我们的条目 + 用户后来新加的;
+//                    基线 = 备份 ∪ 新加的;noresolv 用备份的(此刻的 noresolv=1 是接管设的,不是用户的)
+//   上次是 domains  用户的上游原样在 uci 里,此刻列表(去掉我们的)就是用户现在的设置——加了算加,
+//                    删了算删;noresolv 也是用户此刻的(domains 写的就是基线值)
+//   没接管过 / none  此刻的就是用户的
+//   老版本现场      没有状态文件却有我们的条目:按 all 处理;备份里若残留我们的条目一律剔掉
+const readBaseline = async (ctx, paths, current, prevPlan) => {
   const bp = backupPath(paths)
-  // 还原 = 这份配置不再需要接管(切到别的模式,或部署失败回滚),开机也不要再照抄
+  const backup = (await ctx.exists(bp)) ? parseBackup(await ctx.readFile(bp)) : null
+  const backupServers = backup ? backup.servers.filter((v) => !isOurs(v)) : []
+  let backupNoresolv = backup && backup.noresolv !== null && backup.noresolv !== undefined ? String(backup.noresolv) : null
+  const backupHadOurs = Boolean(backup && backup.servers.some(isOurs))
+  if (backupHadOurs && !backupServers.length && backupNoresolv === '1') backupNoresolv = null
+  const userNow = current.servers.filter((v) => !isOurs(v))
+  const currentHasOurs = current.servers.some(isOurs)
+  const wasAll = prevPlan === 'all' || (!prevPlan && currentHasOurs && !backup) || (!prevPlan && currentHasOurs && current.servers.length === current.servers.filter(isOurs).length)
+  if (wasAll) {
+    const servers = [...backupServers, ...userNow.filter((v) => !backupServers.includes(v))]
+    const noresolv = backup ? backupNoresolv : (userNow.length ? null : null)
+    return { servers, noresolv }
+  }
+  return { servers: userNow, noresolv: current.noresolv === '1' ? '1' : current.noresolv }
+}
+
+// 基线 → 备份文件正文(uci show 形态,段名沿用 uci 里的),init 脚本的 openbox_cleanup 也按这个格式读
+const serializeBackup = async (ctx, baseline) => {
+  const show = String((await ctx.exec('uci', ['-q', 'show', 'dhcp.@dnsmasq[0]'])).stdout || '')
+  const m = /^dhcp\.([^.=\s]+)=dnsmasq/m.exec(show)
+  const section = m ? m[1] : 'dnsmasq'
+  const lines = [`dhcp.${section}=dnsmasq`]
+  if (baseline.servers.length) lines.push(`dhcp.${section}.server=${baseline.servers.map((v) => `'${v}'`).join(' ')}`)
+  if (baseline.noresolv !== null && baseline.noresolv !== undefined) lines.push(`dhcp.${section}.noresolv='${baseline.noresolv}'`)
+  return `${lines.join('\n')}\n`
+}
+
+// 状态文件:第一行写这次实际执行的计划(none / domains / all),init 脚本开机照抄时靠它分辨"面板
+// 明确要求什么都别动"和"老版本没有记录"(复审 R1);后面是我们写进 uci 的上游条目 / 转发文件位置、
+// 以及目标 noresolv
+const stateTextFor = (plan, { servers = [], forward = '', noresolv = null } = {}) =>
+  [`plan=${plan}`, ...servers.map((s) => `server=${s}`), ...(forward ? [`forward=${forward}`] : []), ...(noresolv === '1' ? ['noresolv=1'] : [])].join('\n') + '\n'
+
+const sameList = (a, b) => a.length === b.length && [...a].sort().join('\n') === [...b].sort().join('\n')
+// noresolv 按原值比、按原值写:用户显式写的 '0' 和没设过是两回事,还原时不能把 '0' 变成"删掉"
+const sameUci = (current, target) => sameList(current.servers, target.servers) && (current.noresolv ?? null) === (target.noresolv ?? null)
+const writeUci = async (ctx, target) => {
+  await ctx.exec('uci', ['-q', 'delete', 'dhcp.@dnsmasq[0].server'])
+  for (const s of target.servers) await must(ctx, 'uci', ['add_list', `dhcp.@dnsmasq[0].server=${s}`], `uci add_list server=${s}`)
+  if (target.noresolv !== null && target.noresolv !== undefined) await must(ctx, 'uci', ['set', `dhcp.@dnsmasq[0].noresolv=${target.noresolv}`], 'uci set noresolv')
+  else await ctx.exec('uci', ['-q', 'delete', 'dhcp.@dnsmasq[0].noresolv'])
+}
+
+// 把 conf-dir 里的转发文件拿掉;返回原来有没有
+const removeInstalledForward = async (ctx) => {
+  const installed = await installedForwardPath(ctx)
+  const had = await ctx.exists(installed)
+  if (had) await ctx.remove(installed)
+  return had
+}
+
+export const applyDnsTakeover = async (ctx, paths, { mode, forwardDomains = [], forward, rewriteSources = [] } = {}) => {
+  if (mode !== 'dnsmasq') return { changed: false, actions: [], effective: { mode: 'none', domains: [], reason: '' } }
+  // 计划(engine/routing-model.mjs + system/dns-forward.mjs 展开过的)优先;老调用方只传名单时按老语义折算
+  let plan = forward && typeof forward === 'object'
+    ? forward
+    : { mode: Array.isArray(forwardDomains) && forwardDomains.length ? 'domains' : 'all', domains: forwardDomains, reason: '' }
+
+  const prev = await readState(ctx, paths)
+  const current = await readCurrent(ctx)
+  // 用户基线先算、先落盘(复审 S2):不管这次要不要改 uci,用户后来加的上游都得进备份,
+  // 否则"重复应用同一计划"提前返回时它进不了备份,下一次 none 就把它还原没了
+  const baseline = await readBaseline(ctx, paths, current, prev.plan)
+  await ctx.mkdirp(paths.dataDir)
+  const backupText = await serializeBackup(ctx, baseline)
+  const bp = backupPath(paths)
+  if (!(await ctx.exists(bp)) || (await ctx.readFile(bp)) !== backupText) await ctx.writeFile(bp, backupText)
+
+  // 应用阶段发现名单写不进 dnsmasq(计划阶段本该拦住,这里是最后一道):实际执行 all,并把实际计划
+  // 返回给调用方,状态文件和元数据记的都是实际执行的(复审 S3)
+  if (plan.mode === 'domains') {
+    const bad = (plan.domains || []).find((d) => !dnsmasqSafeDomain(d))
+    if (bad !== undefined) plan = { mode: 'all', domains: [], reason: `域名「${bad}」写不进 dnsmasq,只能全量转发` }
+    else if (!(plan.domains || []).length) plan = { mode: 'none', domains: [], reason: '转发名单是空的,按全部直连处理' }
+  }
+  const effective = { mode: plan.mode, domains: plan.mode === 'domains' ? plan.domains : [], reason: plan.reason || '' }
+  // 用户显式启用的重写答案应能交回终端:固定地址、以及 CNAME 目标最终都可能是内网地址。
+  // 只豁免这些源域名,不关闭全局 rebind 保护,也不改用户的 uci rebind_domain 列表。
+  // dnsmasq 2.90 的 rebind 例外不支持 *. 通配符,用完整标签后缀;根域也会豁免重绑定检查,
+  // 但不会因此被重写(真正的精确 / 泛域匹配仍由重写服务负责)。不能把 * 原样写进去导致例外失效。
+  // 和转发条目放在同一份受管文件,停止 / 切模式 / 删除规则时沿用同一套清理与开机重放。
+  const rebindText = [...new Set(rewriteSources.map((s) => normalizeDomain(s, { allowWildcard: true }).replace(/^\*\./, '')).filter(Boolean))]
+    .sort().map((s) => `rebind-domain-ok=/${s}/\n`).join('')
+
+  // ---------- none:原 DNS 原样。接管过就按(刚刷新过的)基线还原;转发文件拿掉 ----------
+  if (plan.mode === 'none') {
+    const hadBackup = await ctx.exists(bp)
+    const target = { servers: baseline.servers, noresolv: baseline.noresolv }
+    const removed = await removeInstalledForward(ctx)
+    if (await ctx.exists(dnsForwardFilePath(paths))) await ctx.remove(dnsForwardFilePath(paths))
+    const uciSame = sameUci(current, target)
+    if (!uciSame) {
+      await writeUci(ctx, target)
+      await must(ctx, 'uci', ['commit', 'dhcp'], 'uci commit dhcp')
+    }
+    if (!uciSame || removed) await must(ctx, '/etc/init.d/dnsmasq', ['restart'], 'dnsmasq 重启')
+    // 还原到位 = 不再接管:备份消费掉(init 的 stop 看到没有备份就不动 dnsmasq),状态记 none
+    if (hadBackup) await ctx.remove(bp)
+    await ctx.writeFile(dnsTakeoverStatePath(paths), stateTextFor('none'))
+    return { changed: !uciSame || removed, actions: [!uciSame || removed ? 'restore:none' : 'none'], effective }
+  }
+
+  // ---------- domains:uci = 用户基线原样;转发文件进 conf-dir ----------
+  if (plan.mode === 'domains') {
+    const text = forwardConfText(plan.domains) + rebindText
+    const installed = await installedForwardPath(ctx)
+    const confSame = (await ctx.exists(installed)) && (await ctx.readFile(installed)) === text
+    const target = { servers: baseline.servers, noresolv: baseline.noresolv }
+    const uciSame = sameUci(current, target)
+    const stateText = stateTextFor('domains', { forward: installed, noresolv: target.noresolv })
+    await ctx.writeFile(dnsForwardFilePath(paths), text)
+    if (confSame && uciSame) {
+      await ctx.writeFile(dnsTakeoverStatePath(paths), stateText)
+      return { changed: false, actions: ['unchanged'], effective }
+    }
+    if (!confSame) {
+      await ctx.mkdirp(installed.slice(0, installed.lastIndexOf('/')))
+      await ctx.writeFile(installed, text)
+    }
+    if (!uciSame) {
+      await writeUci(ctx, target)
+      // 闪存写满时 commit 静默失败,dnsmasq 重启后还是旧配置——不能报"部署成功"
+      await must(ctx, 'uci', ['commit', 'dhcp'], 'uci commit dhcp')
+    }
+    await must(ctx, '/etc/init.d/dnsmasq', ['restart'], 'dnsmasq 重启')
+    await ctx.writeFile(dnsTakeoverStatePath(paths), stateText)
+    return { changed: true, actions: ['backup', 'set-per-domain', 'restart-dnsmasq'], effective }
+  }
+
+  // ---------- all:上游只剩内核,noresolv=1;受管文件只保留重写的 rebind 例外 ----------
+  const installed = await installedForwardPath(ctx)
+  let confChanged = false
+  if (rebindText) {
+    confChanged = !(await ctx.exists(installed)) || (await ctx.readFile(installed)) !== rebindText
+    await ctx.writeFile(dnsForwardFilePath(paths), rebindText)
+    if (confChanged) {
+      await ctx.mkdirp(installed.slice(0, installed.lastIndexOf('/')))
+      await ctx.writeFile(installed, rebindText)
+    }
+  } else {
+    confChanged = await removeInstalledForward(ctx)
+    if (await ctx.exists(dnsForwardFilePath(paths))) await ctx.remove(dnsForwardFilePath(paths))
+  }
+  const target = { servers: [SINGBOX_DNS_UPSTREAM], noresolv: '1' }
+  const stateText = stateTextFor('all', { servers: target.servers, noresolv: '1' })
+  const uciSame = sameUci(current, target)
+  if (uciSame && !confChanged) {
+    await ctx.writeFile(dnsTakeoverStatePath(paths), stateText)
+    return { changed: false, actions: ['unchanged'], effective }
+  }
+  if (!uciSame) {
+    await writeUci(ctx, target)
+    await must(ctx, 'uci', ['commit', 'dhcp'], 'uci commit dhcp')
+  }
+  await must(ctx, '/etc/init.d/dnsmasq', ['restart'], 'dnsmasq 重启')
+  await ctx.writeFile(dnsTakeoverStatePath(paths), stateText)
+  return { changed: true, actions: ['backup', 'set-upstream', 'restart-dnsmasq'], effective }
+}
+
+// 还原到接管前(切到别的 DNS 模式、部署失败回滚):按备份重建 uci、拿掉转发文件、删状态文件
+export const restoreDnsTakeover = async (ctx, paths) => {
+  const bp = backupPath(paths)
   const sp = dnsTakeoverStatePath(paths)
   if (await ctx.exists(sp)) await ctx.remove(sp)
+  if (await ctx.exists(dnsForwardFilePath(paths))) await ctx.remove(dnsForwardFilePath(paths))
+  await removeInstalledForward(ctx)
   const hasBackup = await ctx.exists(bp)
   try {
     if (hasBackup) {
-      // 有备份 = Open-Box 确实接管过 dnsmasq:整段清空后按备份重建,恢复到接管前状态。
+      // 有备份 = Open-Box 确实接管过 dnsmasq:整段清空后按备份重建,恢复到接管前状态
       await ctx.exec('uci', ['-q', 'delete', 'dhcp.@dnsmasq[0].server'])
       await ctx.exec('uci', ['-q', 'delete', 'dhcp.@dnsmasq[0].noresolv'])
       const { servers, noresolv } = parseBackup(await ctx.readFile(bp))
-      for (const s of servers) await must(ctx, 'uci', ['add_list', `dhcp.@dnsmasq[0].server=${s}`], `uci add_list server=${s}`)
+      for (const s of servers.filter((v) => !isOurs(v))) await must(ctx, 'uci', ['add_list', `dhcp.@dnsmasq[0].server=${s}`], `uci add_list server=${s}`)
       if (noresolv !== null) await must(ctx, 'uci', ['set', `dhcp.@dnsmasq[0].noresolv=${noresolv}`], 'uci set noresolv')
     } else {
       // 无备份 = 从未接管过(默认 hijack 模式下的失败回滚也会走到这里)。
@@ -147,8 +288,7 @@ export const restoreDnsTakeover = async (ctx, paths) => {
     await ctx.exec('uci', ['-q', 'revert', 'dhcp'])
     throw error
   }
-  // 备份只在重建、commit、dnsmasq 重启都成功之后才删:任何一步失败,备份留着下次还能重来。
-  // 以前是重建完就删,commit 失败时原上游只剩在被删掉的备份里,再也恢复不了。
+  // 备份只在重建、commit、dnsmasq 重启都成功之后才删:任何一步失败,备份留着下次还能重来
   if (hasBackup) await ctx.remove(bp)
   return { restored: true }
 }

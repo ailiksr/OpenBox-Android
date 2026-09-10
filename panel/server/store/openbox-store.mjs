@@ -1,6 +1,8 @@
+import path from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { BUILTIN_REGIONS } from '../engine/routing-model.mjs'
 import { defaultGroups, normalizeGroups } from '../engine/user-groups.mjs'
+import { DEFAULT_DIRECT_TEST_URL, DEFAULT_TEST_URL } from '../engine/test-url.mjs'
 
 export const KEYS = {
   profile: 'openbox/profile',
@@ -21,6 +23,12 @@ export const DEFAULT_PROFILE = {
   // v6 地址、并在防火墙上 REJECT 掉 lan→wan 的 v6——也就是干脆不走 IPv6,免得它绕开
   // 隧道直连出去。要用 v6 的人在「其他」页签里自己打开。
   ipv6: false,
+  // IPv6 开着时,走代理的目标怎么处理(engine/dns.mjs 的 ipv6ProxyMode):
+  //   node:v6 目标和 v4 一样交给节点(老行为);
+  //   ipv4:走代理的域名不给 AAAA(终端自然用 v4),裸 v6 目标要走代理时在内核里明确拒绝——
+  //        代理线路不支持 v6 时用它,直连的 v6 照常。
+  //   bypass:v6 根本不进内核,按系统路由直接从 WAN 出去(OpenClash / DAE 的默认行为,GitHub #36)。
+  ipv6Proxy: 'node',
   // 订阅链接和节点服务器的地址一律直连,不看站点集(engine/direct-hosts.mjs)
   directForNodes: true,
   tun: { autoRedirect: true },
@@ -28,16 +36,17 @@ export const DEFAULT_PROFILE = {
   servers: [],
   // 终端分流:按局域网来源 IP 指定出口(engine/client-routes.mjs),默认没有
   clientRoutes: [],
-  // mode:off 不碰 DNS / hijack 防火墙劫持(Android 默认);见 engine/dns.mjs
-  dns: { split: true, mode: 'hijack', direct: '223.5.5.5', proxy: '8.8.8.8' },
+  // mode:off 不碰 DNS / hijack 防火墙劫持 / dnsmasq 转发(默认;见 engine/dns.mjs 与 system/dns-takeover.mjs)
+  dns: { split: true, mode: 'dnsmasq', direct: '223.5.5.5', proxy: '1.1.1.1' },
   // 每日流量这些分析数据在库里留多久(月)。面板「后端设置」里可改,1~36。
   // 按正式路由器实测,按天的记录一天大约 0.75MB,3 个月 ≈ 70MB;小时明细另外只留 7 天
   // (见 system/traffic-collector.mjs)
   traffic: { keepMonths: 3 },
   // 测速地址。testUrl 给自动择优(url-test)组和面板的延迟测试用;directTestUrl 只给内置
   // 直连出站用——默认那个是 Google 的域名,从国内直连去测量出来的是"直连到 Google 有多远"。
-  testUrl: 'http://www.gstatic.com/generate_204',
-  directTestUrl: 'http://www.msftconnecttest.com/connecttest.txt',
+  // 都是 https:内核的 clash API 不认 http 的测速地址(见 engine/test-url.mjs)
+  testUrl: DEFAULT_TEST_URL,
+  directTestUrl: DEFAULT_DIRECT_TEST_URL,
   // 自动更新计划(面板进程内的定时器,见 system/scheduler.mjs):默认都关
   // channel 是自动更新走的通道;checkChannel 是卡片上手动「检查更新 / 立即更新」那个下拉框
   // 上次选的通道,记下来免得每次进页面都要重选
@@ -63,7 +72,7 @@ export const DEFAULT_PROFILE = {
     directRulesets: ['geosite-cn', 'geoip-cn'],
     fallback: 'PROXY',
   },
-  rulesetDir: (process.env.OPENBOX_ROOT || '/data/adb/modules/openbox_android') + '/data/rulesets',
+  rulesetDir: path.join(process.env.OPENBOX_ROOT || '/data/adb/modules/openbox_android', 'data', 'rulesets'),
 }
 
 const DEFAULT_DEPLOY_STATE = { stage: 'idle', message: '', at: 0, badTags: [] }
@@ -98,15 +107,7 @@ export const createStore = ({ get, set, del }, { randomHex = defaultRandomHex } 
   const getProfile = () => {
     const raw = get(KEYS.profile)
     const stored = parseJsonOr(raw, {})
-    const profile = deepMerge(DEFAULT_PROFILE, isPlainObject(stored) ? stored : {})
-    const root = process.env.OPENBOX_ROOT || '/data/adb/modules/openbox_android'
-    if (profile.rulesetDir && profile.rulesetDir.includes('/opt/open-box')) {
-      profile.rulesetDir = profile.rulesetDir.replace(/\/opt\/open-box/g, root)
-    }
-    if (profile.dns && profile.dns.mode === 'dnsmasq') {
-      profile.dns.mode = 'hijack'
-    }
-    return profile
+    return deepMerge(DEFAULT_PROFILE, isPlainObject(stored) ? stored : {})
   }
 
   const setProfile = (patch) => {

@@ -50,7 +50,7 @@ test('全新安装同时写入默认档案(目标分流);已有 openbox/profile 
   assert.equal(defaults.routing.fallbackName, '其他')
   // 不带任何个人域名
   // 默认档案取自作者自己的路由器,发出去之前必须把个人域名摘干净
-  const PERSONAL = /personal-domain-filter/
+  const PERSONAL = /example-blocked-domain|example-blocked-domain|example-blocked-domain|wanhouse|wan\.family|ok1248/
   for (const p of defaults.routing.policies)
     for (const d of [...(p.domain || []), ...(p.domainSuffix || []), ...(p.domainKeyword || [])])
       assert.ok(!PERSONAL.test(d), d)

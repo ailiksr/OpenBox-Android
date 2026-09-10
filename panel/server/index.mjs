@@ -1,6 +1,5 @@
-import { setupAndroidDns } from './system/android-dns.mjs'
-setupAndroidDns()
-
+import './system/android-dns.mjs'
+import { registerAndroidAppRoutes } from './api/android-apps.mjs'
 import express from 'express'
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import fs from 'node:fs'
@@ -9,6 +8,9 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { WebSocket, WebSocketServer } from 'ws'
+import { createDnsFilterObserver, createDnsFilterStore } from './system/dns-filter-observer.mjs'
+import { readFilterArtifact } from './system/dns-filter.mjs'
+import { registerDnsFilterRoutes } from './api/dns-filter.mjs'
 import { registerDeployRoutes } from './api/deploy.mjs'
 import { registerGroupRoutes } from './api/groups.mjs'
 import { registerNodeLatencyRoutes } from './api/node-latency.mjs'
@@ -18,18 +20,28 @@ import { registerServiceRoutes } from './api/service.mjs'
 import { registerRulesetRoutes } from './api/rulesets.mjs'
 import { registerUpdateRoutes } from './api/updates.mjs'
 import { registerRouteTestRoutes } from './api/route-test.mjs'
+import { registerTerminalTestRoutes } from './api/terminal-test.mjs'
+import { teardownProbeNetns } from './system/lan-probe.mjs'
 import { registerTrafficRoutes } from './api/traffic.mjs'
 import { registerLatencyHistoryRoutes } from './api/latency-history.mjs'
 import { createLatencyHistory } from './system/latency-history.mjs'
 import { createLatencyScheduler } from './system/latency-scheduler.mjs'
+import { createFailoverManager } from './system/failover-manager.mjs'
+import { createDnsRewriteServer } from './system/dns-rewrite-server.mjs'
+import { DNS_REWRITE_TAG, ensureDnsRewriteDefaults } from './engine/dns-rewrite.mjs'
+import { ensureTestUrlDefaults } from './engine/test-url.mjs'
+import { decideDnsServer } from './api/route-test.mjs'
+import { readSystemDns } from './system/resolv.mjs'
+import { registerFailoverRoutes } from './api/failover.mjs'
 import { registerServerRoutes } from './api/servers.mjs'
 import { registerBackupRoutes } from './api/backup.mjs'
+import { registerDiagnosticsRoutes } from './api/diagnostics.mjs'
 import { readMeta } from './system/updater.mjs'
 import { seedDefaultStorage } from './system/seed-defaults.mjs'
-import { runDeploy, fetchSelections, resolveSelections, dnsClassesFlipped } from './api/deploy-runner.mjs'
+import { runDeploy, fetchSelections, resolveSelections, regenerateIfPlanChanged } from './api/deploy-runner.mjs'
+import { flushDnsCache } from './system/dns-cache.mjs'
 import { startScheduler } from './system/scheduler.mjs'
 import { createTrafficCollector, createTrafficStore } from './system/traffic-collector.mjs'
-import { registerAndroidAppRoutes } from './api/android-apps.mjs'
 import { registerSubscriptionRoutes } from './api/subscriptions.mjs'
 import { subscriptionFetch } from './system/insecure-fetch.mjs'
 import { createStore } from './store/openbox-store.mjs'
@@ -37,8 +49,8 @@ import { createRealContext } from './system/context-real.mjs'
 import { createPaths } from './system/paths.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const rootDir = path.resolve(__dirname, '..')
-const distDir = path.join(rootDir, 'dist')
+const rootDir = process.env.OPENBOX_ROOT || path.resolve(__dirname, '..')
+const distDir = fs.existsSync(path.join(rootDir, 'panel', 'dist')) ? path.join(rootDir, 'panel', 'dist') : path.join(rootDir, 'dist')
 const dataDir = path.join(rootDir, 'data')
 const dbPath = process.env.ZASHBOARD_DB_PATH || path.join(dataDir, 'zashboard.sqlite')
 const host = process.env.HOST || '0.0.0.0'
@@ -154,6 +166,18 @@ const store = createStore({
   set: (key, value) => upsertStorageValueStatement.run(key, value),
   del: (key) => deleteStorageValueStatement.run(key),
 })
+// DNS 重写第一次引入时补两条默认规则(只在还没初始化的档案上做一次;用户之后改 / 停 / 删都算数)
+try {
+  if (ensureDnsRewriteDefaults(store)) console.log('[dns-rewrite] 档案首次初始化 DNS 重写,写入默认规则')
+} catch (err) {
+  console.log(`[dns-rewrite] 初始化默认规则失败:${err instanceof Error ? err.message : err}`)
+}
+// 测速地址还是老的 http 默认值的换成 https 默认(内核的 clash API 不认 http,见 engine/test-url.mjs)
+try {
+  if (ensureTestUrlDefaults(store)) console.log('[profile] 测速地址从老的 http 默认值换成 https 默认值')
+} catch (err) {
+  console.log(`[profile] 迁移测速地址失败:${err instanceof Error ? err.message : err}`)
+}
 
 // 会话密钥落库,不是每次启动随机生成:否则升级 / 重启面板 / 路由器重启后进程一换,所有
 // 浏览器 cookie 立刻失效、被踢回登录页(升级到"替换文件"阶段面板重启就会当场弹登录)。
@@ -534,12 +558,19 @@ const syncSelectionsAfterProxySwitch = () => {
   if (selectionSyncTimer) clearTimeout(selectionSyncTimer)
   selectionSyncTimer = setTimeout(async () => {
     selectionSyncTimer = null
+    // 先清 DNS 缓存:缓存里的答案是上一条线路问出来的,换了线路还用它,连上去的 CDN
+    // 就不是新线路就近的那个(见 system/dns-cache.mjs)。翻面要重启的情况下重启本身也会
+    // 清掉,这里清一次是为了"只换线路、不重启"的那种切换——那才是大多数。
+    try {
+      await flushDnsCache(fetch, store.getClashSecret())
+    } catch {
+      // 清不掉不影响下面的同步
+    }
     try {
       const selections = resolveSelections(store, await fetchSelections(fetch, store.getClashSecret()))
-      if (!(await dnsClassesFlipped(obCtx, obPaths, store, selections))) return
-      console.log('[proxies] 站点集在直连/代理之间翻面,后台重新生成配置')
-      const r = await runDeploy({ store, ctx: obCtx, paths: obPaths })
-      if (!r.ok) console.warn(`[proxies] 重新生成配置失败(${r.stage}):${r.message}`)
+      // DNS 分类翻面,或第一层计划(入口旁路指纹 / DNS 转发三态 / v6 保护的出口类别)变了,都得重新生成
+      // (判断和执行都在 api/deploy-runner.mjs 的 regenerateIfPlanChanged 里)
+      await regenerateIfPlanChanged({ store, ctx: obCtx, paths: obPaths, selections, log: (m) => console.log(m) })
     } catch (error) {
       console.warn('[proxies] 同步选择失败:', error instanceof Error ? error.message : error)
     }
@@ -969,8 +1000,9 @@ app.use((req, res, next) => {
     return
   }
 
-  // /api/health、/api/auth/status、/api/auth/setup、/api/android/* 永远可达:
-  if (PASSWORD_SETUP_EXEMPT_PATHS.has(normalizedPath) || normalizedPath.startsWith('/api/android/')) {
+  // /api/health、/api/auth/status、/api/auth/setup 永远可达:
+  // 不论是否已设密,前端都得能查状态、走设密流程;setup 路由自己会在已设密时拒绝(409)。
+  if (PASSWORD_SETUP_EXEMPT_PATHS.has(normalizedPath)) {
     next()
     return
   }
@@ -1072,16 +1104,17 @@ app.delete('/api/background-image', (_req, res) => {
 // 因此天然继承"未设密一律 403、已设密未认证一律 401"的保护,无需各自重复鉴权。
 // 订阅拉取用不校验证书的 fetch(自签 / 过期证书的自建订阅也能加),不能传系统 fetch 把它盖掉
 registerSubscriptionRoutes(app, { store, fetchImpl: subscriptionFetch })
+registerAndroidAppRoutes(app, { paths: obPaths, ctx: obCtx })
 registerProfileRoutes(app, { store })
 registerDeployRoutes(app, { store, ctx: obCtx, paths: obPaths })
 registerServiceRoutes(app, { store, ctx: obCtx, paths: obPaths })
 registerRulesetRoutes(app, { store, ctx: obCtx, paths: obPaths, fetchImpl: globalThis.fetch })
 registerPenetrationRoutes(app, { store, ctx: obCtx, paths: obPaths, fetchImpl: globalThis.fetch })
-registerNodeLatencyRoutes(app, { ctx: obCtx, paths: obPaths, fetchImpl: globalThis.fetch })
+registerNodeLatencyRoutes(app, { ctx: obCtx, paths: obPaths, store, fetchImpl: globalThis.fetch })
 registerGroupRoutes(app, { store })
 registerUpdateRoutes(app, { store, ctx: obCtx, paths: obPaths, fetchImpl: globalThis.fetch })
 registerRouteTestRoutes(app, { store, ctx: obCtx, paths: obPaths, fetchImpl: globalThis.fetch })
-registerAndroidAppRoutes(app, { paths: obPaths, ctx: obCtx })
+registerTerminalTestRoutes(app, { store, ctx: obCtx, paths: obPaths, fetchImpl: globalThis.fetch })
 // 每日流量:面板常驻读内核连接表,按天/节点/域名把字节数记进 cache.db(system/traffic-collector.mjs);
 // 采集在 startServer 里才启动,单独 import 本模块(测试)不会去碰内核
 const trafficCollector = createTrafficCollector({
@@ -1092,14 +1125,54 @@ const trafficCollector = createTrafficCollector({
   getKeepMonths: () => ((store.getProfile() || {}).traffic || {}).keepMonths,
   log: (m) => console.log(m),
 })
-registerTrafficRoutes(app, { collector: trafficCollector, ctx: obCtx, paths: obPaths })
+registerTrafficRoutes(app, { collector: trafficCollector, ctx: obCtx, paths: obPaths, store })
 // 延迟历史 + 自动组的硬性定时测速(system/latency-scheduler.mjs):sing-box 的 URLTest 只在有流量时才按
 // interval 测,闲置的组停在启动那一次;这里由面板按 interval 定时调内核测,结果记进 openbox/latency-history,
 // 所有浏览器共享。和流量采集一样只在 startServer 里启动。
 const latencyHistory = createLatencyHistory({ store })
 const latencyScheduler = createLatencyScheduler({ store, ctx: obCtx, paths: obPaths, history: latencyHistory, fetchImpl: globalThis.fetch, log: (m) => console.log(m) })
 registerLatencyHistoryRoutes(app, { history: latencyHistory, scheduler: latencyScheduler })
+// 故障转移组的后台主备管理(system/failover-manager.mjs):按 config.meta.json 里的运行映射定期端到端探测各页签
+// 的节点、组内先恢复、组间按顺序转移、主用恢复后切回、全部失败切兜底拒绝。跟随服务端生命周期,浏览器关了照样跑
+const failoverManager = createFailoverManager({ store, ctx: obCtx, paths: obPaths, history: latencyHistory, fetchImpl: globalThis.fetch, log: (m) => console.log(m) })
+registerFailoverRoutes(app, { manager: failoverManager })
+// DNS 重写的应答服务(system/dns-rewrite-server.mjs):内核把命中重写源域名的查询交到 127.0.0.1:7854,这里按档案
+// 里此刻的规则生成答案;没命中的按直连侧上游(WAN 下发的 DNS)解析
+// 「代理 v6 降为 IPv4」时重写服务要知道源域名按现有分流走不走代理:按已部署的 config.json 里的 DNS 规则判(跳过重写
+// 规则本身),配置按 meta.generatedAt 缓存,只在重新部署后重读
+let deployedDnsConfig = { version: null, config: null }
+const readDeployedConfig = async () => {
+  let version = ''
+  try { version = String(JSON.parse(await obCtx.readFile(`${obPaths.etc}/config.meta.json`)).generatedAt || '') } catch { version = '' }
+  if (deployedDnsConfig.config && deployedDnsConfig.version === version) return deployedDnsConfig.config
+  const config = JSON.parse(await obCtx.readFile(obPaths.configPath))
+  deployedDnsConfig = { version, config }
+  return config
+}
+const dnsRewriteSourceViaProxy = async (name) => {
+  try {
+    const config = await readDeployedConfig()
+    const d = await decideDnsServer(obCtx, obPaths, config, name, { ignoreServers: [DNS_REWRITE_TAG] })
+    if (!d || d.error) return null
+    if (d.rejected) return false
+    return Boolean(d.viaProxy)
+  } catch { return null }
+}
+const dnsRewriteServer = createDnsRewriteServer({ store, fallbackServers: () => readSystemDns(obCtx).catch(() => []), sourceViaProxy: dnsRewriteSourceViaProxy, log: (m) => console.log(m) })
+const dnsFilterData = createDnsFilterStore(db)
+const dnsFilterObserver = createDnsFilterObserver({
+  data: dnsFilterData, readConfig: readDeployedConfig, getSecret: () => store.getClashSecret(),
+  getNames: () => Object.fromEntries((readFilterArtifact(store)?.blocks || []).map((b) => [b.tag, b.name])),
+  enabled: async () => {
+    try { return JSON.parse(await obCtx.readFile(`${obPaths.etc}/config.meta.json`)).dnsFilter?.enabled === true }
+    catch { return false }
+  },
+})
+const dnsFilterUpdater = registerDnsFilterRoutes(app, { store, ctx: obCtx, paths: obPaths, data: dnsFilterData, observer: dnsFilterObserver })
+let dnsFilterTimer
 registerServerRoutes(app, { store, ctx: obCtx })
+// 导出诊断包(后端设置那张卡片):版本、固件、内核状态、脱敏配置、最近日志,给 issue 用
+registerDiagnosticsRoutes(app, { store, ctx: obCtx, paths: obPaths })
 // 导出 / 导入(后端设置那张卡片):档案 + 节点组,可选订阅和节点
 registerBackupRoutes(app, {
   store,
@@ -1163,7 +1236,9 @@ if (fs.existsSync(distDir)) {
           return
         }
 
-        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate')
+        if (/^index-[A-Za-z0-9_-]+\.(js|css)$/.test(fileName)) {
+          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+        }
       },
     }),
   )
@@ -1224,6 +1299,14 @@ websocketServer.on('connection', relayControllerWebSocket)
 const startServer = async () => {
   trafficCollector.start()
   latencyScheduler.start()
+  failoverManager.start()
+  dnsRewriteServer.start().catch(() => {})
+  dnsFilterObserver.start()
+  clearInterval(dnsFilterTimer)
+  dnsFilterTimer = setInterval(() => dnsFilterUpdater.updateIfDue().catch((error) => console.log(`[dns-filter] 更新失败: ${error.message}`)), 60000)
+  dnsFilterTimer.unref?.()
+  // 上一个面板进程留下的虚拟终端(模拟 LAN 终端测试用的网络命名空间)先拆掉,不留孤儿接口挂在网桥上
+  teardownProbeNetns(obCtx).catch(() => {})
   if (server.listening) {
     return server
   }
@@ -1270,6 +1353,10 @@ const shutdownServer = async () => {
   // 先把攒着没写的流量增量落盘,再关库
   trafficCollector.stop()
   latencyScheduler.stop()
+  failoverManager.stop()
+  dnsRewriteServer.stop()
+  clearInterval(dnsFilterTimer)
+  dnsFilterObserver.stop()
   if (typeof db.close === 'function') {
     db.close()
   }

@@ -151,6 +151,29 @@ test('sqlite store:upsert 累加、按月/按天查询、清理', { skip: !sqlit
   assert.equal(store.month('2026-09').length, 1)
 })
 
+test('sqlite store:某个出站按天 / 按月 / 按小时的量(概览「统计直连流量」关掉时扣直连用);按月不混进「天@小时」行', { skip: !sqlite && '本机 Node 没有 node:sqlite' }, () => {
+  const db = new sqlite.DatabaseSync(':memory:')
+  const store = createTrafficStore(db)
+  store.add([
+    { day: '2026-09-03', kind: 'node', key: '直连', up: 10, down: 100, conns: 2 },
+    { day: '2026-09-03', kind: 'node', key: 'A', up: 60, down: 500, conns: 4 },
+    { day: '2026-09-03@13', kind: 'node', key: '直连', up: 4, down: 40, conns: 1 },
+    { day: '2026-09-03@20', kind: 'node', key: '直连', up: 6, down: 60, conns: 1 },
+    { day: '2026-09-04', kind: 'node', key: '直连', up: 1, down: 1, conns: 1 },
+    { day: '2026-10-01', kind: 'node', key: '直连', up: 9, down: 9, conns: 9 },
+  ])
+  assert.deepEqual(store.nodeRow('2026-09-03', '直连'), { up: 10, down: 100, conns: 2 })
+  assert.deepEqual(store.nodeRow('2026-09-03@13', '直连'), { up: 4, down: 40, conns: 1 })
+  assert.equal(store.nodeRow('2026-09-05', '直连'), null)
+  assert.deepEqual(store.monthNode('2026-09', '直连'), [
+    { day: '2026-09-03', up: 10, down: 100, conns: 2 },
+    { day: '2026-09-04', up: 1, down: 1, conns: 1 },
+  ])
+  const hours = store.nodeHours('2026-09-03', '直连')
+  assert.deepEqual([...hours.entries()], [[13, { up: 4, down: 40, conns: 1 }], [20, { up: 6, down: 60, conns: 1 }]])
+  assert.equal(store.nodeHours('2026-09-04', '直连').size, 0)
+})
+
 test('sqlite store:交叉表按前一维 / 后一维查构成,含空串 key;交叉表单独清理', { skip: !sqlite && '本机 Node 没有 node:sqlite' }, () => {
   const db = new sqlite.DatabaseSync(':memory:')
   const store = createTrafficStore(db)
@@ -189,6 +212,24 @@ test('sqlite store:交叉表按前一维 / 后一维查构成,含空串 key;交�
   assert.equal(u.days, 1)
   assert.ok(u.rows > 0 && u.bytes > u.rows * 40)
   assert.equal(u.oldestDay, '2026-09-03')
+  assert.equal(u.hourDays, 0)
+  assert.equal(u.hourBytes, 0)
+  assert.equal(u.bytes, u.dayBytes)
+  // 加两天的小时明细(「天@小时」行):天数、最早 / 最新那天不受它们影响,字节数按天 / 按小时分开
+  store.add([
+    { day: '2026-09-03@10', kind: 'hour', key: '10', up: 1, down: 2, conns: 1 },
+    { day: '2026-09-03@11', kind: 'node', key: '香港 | 01', up: 1, down: 2, conns: 1 },
+    { day: '2026-09-04@00', kind: 'hour', key: '00', up: 1, down: 2, conns: 1 },
+  ])
+  const u2 = store.usage()
+  assert.equal(u2.days, 1, '小时明细行不算天')
+  assert.equal(u2.oldestDay, '2026-09-03')
+  assert.equal(u2.newestDay, '2026-09-03', '最新那天不能是「天@小时」')
+  assert.equal(u2.hourDays, 2)
+  assert.equal(u2.dayBytes, u.dayBytes)
+  assert.ok(u2.hourBytes > 0)
+  assert.equal(u2.bytes, u2.dayBytes + u2.hourBytes)
+  assert.equal(u2.rows, u.rows + 3)
 })
 
 test('dnsmasq 回环出站不算流量:不进任何维度,总量也把它减掉', () => {

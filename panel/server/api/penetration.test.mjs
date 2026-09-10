@@ -5,6 +5,7 @@ import { registerPenetrationRoutes, matchRuleSet , matchLocalConditions } from '
 import { createStore } from '../store/openbox-store.mjs'
 import { createMockContext } from '../system/context.mjs'
 import { createPaths } from '../system/paths.mjs'
+import { routingFingerprint } from '../engine/routing-model.mjs'
 
 const paths = createPaths('/opt/open-box')
 const cmds = (ctx) => ctx.calls.map((c) => [c.cmd, ...c.args].join(' '))
@@ -51,11 +52,11 @@ const startApp = async ({ ctx, store, fetchImpl } = {}) => {
   }
 }
 
-const post = async (baseUrl, target) => {
+const post = async (baseUrl, target, extra = {}) => {
   const res = await fetch(`${baseUrl}/api/openbox/penetration`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ target }),
+    body: JSON.stringify({ target, ...extra }),
   })
   return { res, body: await res.json() }
 }
@@ -740,7 +741,7 @@ test('POST /penetration:策略的域名条件本地就能判定,不去 exec 内�
   }
 })
 
-test('命中规则集时带回具体命中的条目(内核解码后逐条比),手写条件同样列出', async () => {
+test('命中规则集时带回具体命中的条目(内核解码后逐条比);规则集和手写条件在内核里是紧邻的两条,命中哪条就列哪条的', async () => {
   const srs = `${paths.rulesetDir}/geosite-google.srs`
   const ctx = createMockContext({
     files: {
@@ -768,10 +769,12 @@ test('命中规则集时带回具体命中的条目(内核解码后逐条比),�
     assert.equal(res.status, 200)
     assert.ok(body.matched, 'should match the Google policy rule')
     assert.equal(body.matched.outbound, 'Google')
+    // 站点集的规则集那条排在前、手写域名那条紧跟其后(1.14 的规则集语义,生成器拆开写):mail.google.com 先命中规则集那条
+    assert.deepEqual(body.matched.rule, { rule_set: ['geosite-google'], outbound: 'Google' })
     const entries = body.matched.entries
-    assert.ok(Array.isArray(entries) && entries.length >= 2, JSON.stringify(body.matched))
-    assert.ok(entries.some((e) => e.source === 'custom' && e.type === 'domain_suffix' && e.value === 'google.com'))
+    assert.ok(Array.isArray(entries) && entries.length >= 1, JSON.stringify(body.matched))
     assert.ok(entries.some((e) => e.source === 'geosite-google' && e.type === 'domain_suffix' && e.value === 'google.com'))
+    assert.ok(!entries.some((e) => e.source === 'custom'), '手写条件在下一条规则里,这次没轮到它')
     assert.ok(!entries.some((e) => e.value === 'gstatic.com'))
     assert.equal(body.matched.entriesTotal, entries.length)
   } finally {
@@ -794,4 +797,200 @@ test('订阅和节点站点直连(默认开):目标是某个节点的服务器�
   } finally {
     await close()
   }
+})
+
+// 前置自定义分流命中时,界面上「站点集」后面要显示的是这条条目的名字。它不生成 selector、
+// 出站是具体节点或直连,拿 outbound 当条目名会显示成「站点集 直连」,看不出命中的是哪一条。
+test('命中前置自定义分流:回传条目名 ownerName,出站仍是它自己选的出口', async () => {
+  const store = memStore()
+  store.setProfile({
+    directForNodes: false,
+    routing: {
+      fallbackDefault: 'direct',
+      custom: { name: '前置自定义', rules: [{ type: 'domainSuffix', value: 'wan.family', outbound: 'direct' }] },
+      policies: [{ id: 'a', name: '策略A', rulesets: ['geosite-a'], default: 'NodeA' }],
+    },
+  })
+  const ctx = createMockContext({ files: withSingbox() })
+  const fetchImpl = async () => ({ ok: true, status: 200, json: async () => ({}) })
+  const { baseUrl, close } = await startApp({ ctx, store, fetchImpl })
+  try {
+    const { res, body } = await post(baseUrl, 'os.wan.family')
+    assert.equal(res.status, 200)
+    assert.ok(body.matched, JSON.stringify(body))
+    assert.deepEqual(body.matched.rule.domain_suffix, ['wan.family'])
+    assert.equal(body.matched.ownerName, '前置自定义')
+    // 出站是这一行自己选的出口(内置直连的当前名字)
+    assert.equal(body.finalOutbound, '直连')
+  } finally {
+    await close()
+  }
+})
+
+test('命中站点集时不带 ownerName:它的名字就是出站名,界面直接用 outbound', async () => {
+  const store = memStore()
+  store.setProfile({
+    directForNodes: false,
+    routing: {
+      fallbackDefault: 'direct',
+      custom: { rules: [{ type: 'domainSuffix', value: 'other.example', outbound: 'direct' }] },
+      policies: [{ id: 'a', name: '策略A', domainSuffix: ['a.example.com'], default: 'NodeA' }],
+    },
+  })
+  const ctx = createMockContext({ files: withSingbox() })
+  const fetchImpl = async () => ({ ok: true, status: 200, json: async () => ({ name: 'NodeA' }) })
+  const { baseUrl, close } = await startApp({ ctx, store, fetchImpl })
+  try {
+    const { body } = await post(baseUrl, 'a.example.com')
+    assert.equal(body.matched.outbound, '策略A')
+    assert.equal(body.matched.ownerName, undefined)
+  } finally {
+    await close()
+  }
+})
+
+// 分流改了但内核没重启时,「规则路由」按当前设置推算、「真实路由」是内核此刻的行为,两者
+// 本来就会对不上。界面要能说清楚,所以服务端拿部署时记下的分流指纹和当前档案比一比。
+test('分流改过但没重启:回传 routingStale', async () => {
+  const store = memStore()
+  const routing = { fallbackDefault: 'direct', policies: [{ id: 'a', name: '策略A', domainSuffix: ['a.example.com'], default: 'NodeA' }] }
+  store.setProfile({ directForNodes: false, routing })
+  const metaPath = '/opt/open-box/etc/config.meta.json'
+  const run = async (meta) => {
+    const ctx = createMockContext({ files: { ...withSingbox(), [metaPath]: JSON.stringify(meta) } })
+    const fetchImpl = async () => ({ ok: true, status: 200, json: async () => ({ name: 'NodeA' }) })
+    const { baseUrl, close } = await startApp({ ctx, store, fetchImpl })
+    try {
+      return (await post(baseUrl, 'a.example.com')).body
+    } finally {
+      await close()
+    }
+  }
+  // 指纹对不上 → 提示
+  assert.equal((await run({ routingHash: '0000000000000000' })).routingStale, true)
+  // 指纹一致 → 不提示
+  const same = await run({ routingHash: routingFingerprint(routing) })
+  assert.equal(same.routingStale, undefined)
+  // 老版本部署出来的 meta 没有这个字段 → 不判,免得误报
+  assert.equal((await run({ dnsMode: 'dnsmasq' })).routingStale, undefined)
+})
+
+// ---------- 复审 R5:IPv6 网段、来源条件、目标 + 端口的组合条件 ----------
+const groupsHK = [{ id: 'hk', name: '香港-自动', type: 'urltest', mode: 'dynamic', keywords: [] }]
+const r5Store = (profilePatch) => {
+  const store = memStore()
+  store.setProfile({ directForNodes: false, ipv6: true, dns: { split: true, mode: 'dnsmasq', direct: '9.9.9.9', proxy: '1.1.1.1' }, routing: { policies: [], fallbackDefault: 'direct' }, ...profilePatch })
+  store.setGroups(groupsHK)
+  store.setNodes(NODES)
+  return store
+}
+const noClash = async () => ({ ok: true, status: 200, json: async () => ({ now: '直连' }) })
+// 按组名给不同的 now(noClash 把所有组都答成直连,比不出"前提的去向和结果不同")
+const clashNow = (map) => async (url) => {
+  const tag = decodeURIComponent(String(url).split('/proxies/')[1] || '')
+  return { ok: true, status: 200, json: async () => (map[tag] ? { now: map[tag] } : {}) }
+}
+
+test('R5a:前置自定义分流写了 IPv6 网段,查 v6 地址要命中它,不能落到兜底', async () => {
+  const store = r5Store({ routing: { policies: [], fallbackDefault: 'direct', custom: { rules: [{ type: 'ipCidr', value: '2001:db8:1234::/48', outbound: '香港-自动' }] } } })
+  const { baseUrl, close } = await startApp({ ctx: createMockContext({}), store, fetchImpl: noClash })
+  try {
+    const { body } = await post(baseUrl, '2001:db8:1234::42')
+    assert.ok(body.matched, JSON.stringify(body))
+    assert.deepEqual(body.matched.rule.ip_cidr, ['2001:db8:1234::/48'])
+    assert.equal(body.matched.outbound, '香港-自动')
+    const miss = await post(baseUrl, '2001:db8:9999::1')
+    assert.equal(miss.body.matched, null)
+  } finally {
+    await close()
+  }
+})
+
+test('R5b:终端分流的来源条件——没给来源 IP 时把那条记成前提(按不在该来源的终端)继续推算,不中断;给了就按来源判', async () => {
+  const store = r5Store({ clientRoutes: [{ id: 'tv', enabled: true, name: 'TV', sources: ['192.168.3.9'], outbound: '香港-自动' }] })
+  const { baseUrl, close } = await startApp({ ctx: createMockContext({}), store, fetchImpl: clashNow({ '香港-自动': 'HK-1', '其他': '直连' }) })
+  try {
+    const none = await post(baseUrl, 'example.com')
+    assert.equal(none.body.matched, null)
+    assert.equal(none.body.finalOutbound, '其他')
+    assert.deepEqual(none.body.chain, ['其他', '直连'])
+    assert.equal(none.body.matchError, undefined)
+    assert.equal(none.body.assumed.length, 1)
+    assert.deepEqual(none.body.assumed[0].needs, ['sourceIp'])
+    assert.deepEqual(none.body.assumed[0].rule.source_ip_cidr, ['192.168.3.9/32'])
+    assert.equal(none.body.assumed[0].outbound, '香港-自动')
+    // 那条终端分流命中时落到 HK-1,这里推算落到直连:去向不同,前提要提示
+    assert.equal(none.body.assumed[0].leaf, 'HK-1')
+    assert.equal(none.body.assumed[0].sameOutcome, false)
+    const hit = await post(baseUrl, 'example.com', { sourceIp: '192.168.3.9' })
+    assert.deepEqual(hit.body.matched.rule.source_ip_cidr, ['192.168.3.9/32'])
+    assert.equal(hit.body.matched.outbound, '香港-自动')
+    const other = await post(baseUrl, 'example.com', { sourceIp: '192.168.3.10' })
+    assert.equal(other.body.matched, null)
+    assert.equal(other.body.finalOutbound, '其他')
+    assert.equal(other.body.assumed, undefined)
+    const bad = await post(baseUrl, 'example.com', { sourceIp: 'not-an-ip' })
+    assert.equal(bad.res.status, 400)
+  } finally {
+    await close()
+  }
+})
+
+test('R5b2:前提的去向和推算结果是同一个出口时标 sameOutcome=true(终端分流让某设备全直连,查的目标本来就直连)', async () => {
+  const store = r5Store({ routing: { policies: [], fallbackDefault: 'direct' }, clientRoutes: [{ id: 'dev', enabled: true, name: 'Dev', sources: ['192.168.3.35'], outbound: '直连' }] })
+  const { baseUrl, close } = await startApp({ ctx: createMockContext({}), store, fetchImpl: noClash })
+  try {
+    const { body } = await post(baseUrl, 'example.com')
+    assert.equal(body.assumed.length, 1)
+    assert.equal(body.assumed[0].outbound, '直连')
+    assert.equal(body.finalOutbound, '其他')
+    assert.deepEqual(body.chain, ['其他', '直连'])
+    assert.equal(body.assumed[0].leaf, '直连')
+    assert.equal(body.assumed[0].sameOutcome, true)
+    // clash API 拿不到时下钻不到叶子,只能按名字比:其他 ≠ 直连,不敢说一样
+    const dead = async () => { throw new Error('ECONNREFUSED') }
+    const { baseUrl: base2, close: close2 } = await startApp({ ctx: createMockContext({}), store, fetchImpl: dead })
+    try {
+      const r2 = (await post(base2, 'example.com')).body
+      assert.deepEqual(r2.chain, ['其他'])
+      assert.equal(r2.assumed[0].sameOutcome, false)
+    } finally {
+      await close2()
+    }
+  } finally {
+    await close()
+  }
+})
+
+test('R5c:目标 + 端口是"与"的关系——查 172.19.0.2:443 不能命中只管 53 端口的 dnsmasq 回送规则,要落到后面的 tun 防回环拒绝;不给端口就把 53 那条记成前提继续', async () => {
+  const store = r5Store({})
+  const { baseUrl, close } = await startApp({ ctx: createMockContext({}), store, fetchImpl: noClash })
+  try {
+    const https = await post(baseUrl, '172.19.0.2', { port: 443 })
+    assert.equal(https.body.matched.action, 'reject', JSON.stringify(https.body.matched))
+    assert.deepEqual(https.body.matched.rule.ip_cidr, ['172.19.0.0/30', 'fdfe:dcba:9876::/126'])
+    const dns = await post(baseUrl, '172.19.0.2', { port: 53 })
+    assert.equal(dns.body.matched.outbound, 'dnsmasq')
+    assert.deepEqual(dns.body.matched.rule.port, [53])
+    const unknown = await post(baseUrl, '172.19.0.2')
+    assert.equal(unknown.body.matched.action, 'reject')
+    assert.equal(unknown.body.matchError, undefined)
+    assert.deepEqual(unknown.body.assumed.map((a) => a.needs), [['port']])
+    assert.deepEqual(unknown.body.assumed[0].rule.port, [53])
+    assert.equal(unknown.body.assumed[0].outbound, 'dnsmasq')
+    assert.equal(unknown.body.assumed[0].sameOutcome, false)
+    const bad = await post(baseUrl, '172.19.0.2', { port: 70000 })
+    assert.equal(bad.res.status, 400)
+  } finally {
+    await close()
+  }
+})
+
+test('evaluateRuleGroups:ip_version 是"与"组——IP 目标按自己的地址族判;域名目标要看终端用 A 还是 AAAA(ipVersion),没给就判不了', async () => {
+  const { evaluateRuleGroups } = await import('./penetration.mjs')
+  const rule = { rule_set: ['geosite-google'], ip_version: 6, action: 'reject' }
+  assert.deepEqual(evaluateRuleGroups(rule, { destMatch: true, ipVersion: 6 }), { result: 'hit' })
+  assert.deepEqual(evaluateRuleGroups(rule, { destMatch: true, ipVersion: 4 }), { result: 'miss' })
+  assert.deepEqual(evaluateRuleGroups(rule, { destMatch: true }), { result: 'undetermined', needs: ['ipVersion'] })
+  assert.deepEqual(evaluateRuleGroups(rule, { destMatch: false, ipVersion: 6 }), { result: 'miss' })
 })

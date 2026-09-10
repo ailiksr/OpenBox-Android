@@ -474,6 +474,11 @@ test('servers 校验:协议/端口/凭据/重复端口/保留端口', async () =
   assert.match(validateServers([{ ...ok[0], password: '' }]), /password/)
   assert.match(validateServers([{ id: 'v', name: 'V', protocol: 'vless', port: 8443, uuid: 'nope' }]), /uuid/)
   assert.match(validateServers([{ id: 'bad id', name: 'x', protocol: 'vless', port: 8443, uuid: '11111111-1111-4111-8111-111111111111' }]), /id/)
+  // mixed:不认证可以,认证要用户名密码成对
+  assert.equal(validateServers([{ id: 'm', name: 'M', protocol: 'mixed', port: 7080 }]), null)
+  assert.equal(validateServers([{ id: 'm', name: 'M', protocol: 'mixed', port: 7080, username: 'u', password: 'p' }]), null)
+  assert.match(validateServers([{ id: 'm', name: 'M', protocol: 'mixed', port: 7080, username: 'u' }]), /set together/)
+  assert.match(validateServers([{ id: 'm', name: 'M', protocol: 'mixed', port: 7080, password: 'p' }]), /set together/)
 })
 
 test('clientRoutes 校验:来源必须是 IP/网段,出口必填,id 不重复', async () => {
@@ -510,4 +515,48 @@ test('validateProfilePatch 图标缩放必须是 ±20 以内的整数(站点集�
   assert.ok(validateProfilePatch({ routing: { fallbackIconScale: 21 } }))
   assert.ok(validateProfilePatch({ routing: { policies: [{ id: 'p', name: 'A', iconScale: -21 }] } }))
   assert.ok(validateProfilePatch({ routing: { policies: [{ id: 'p', name: 'A', iconScale: '1' }] } }))
+})
+
+test('validateProfilePatch 校验前置自定义分流(一行一条规则、一行一个出口)', () => {
+  const ok = { routing: { custom: { rules: [{ type: 'domainSuffix', value: 'a.com', outbound: 'HK' }] } } }
+  assert.equal(validateProfilePatch(ok), null)
+  assert.equal(validateProfilePatch({ routing: { custom: { enabled: false } } }), null)
+
+  const bad = (custom) => String(validateProfilePatch({ routing: { custom } }))
+  assert.match(bad('x'), /routing\.custom must be an object/)
+  assert.match(bad({ name: '  ' }), /name must be a non-empty string/)
+  assert.match(bad({ rules: 'x' }), /rules must be an array/)
+  assert.match(bad({ rules: [{ type: 'nope', value: 'a', outbound: 'HK' }] }), /type must be one of/)
+  assert.match(bad({ rules: [{ type: 'domain', value: ' ', outbound: 'HK' }] }), /value is required/)
+  assert.match(bad({ rules: [{ type: 'domain', value: 'a.com', outbound: '' }] }), /outbound is required/)
+  assert.match(bad({ rules: [{ type: 'ruleUrl', value: 'ftp://x/y', outbound: 'HK' }] }), /must be an http\(s\) URL/)
+  // 规则集名会被拼进 .srs 路径,和站点集同一道路径穿越防线
+  assert.match(bad({ rules: [{ type: 'geosite', value: '../x', outbound: 'HK' }] }), /ruleset name must match/)
+  // 端口:单个 / 范围 / 逗号分隔都行,写错的不收
+  assert.equal(validateProfilePatch({ routing: { custom: { rules: [{ type: 'port', value: '51820, 1000-2000', outbound: 'direct' }] } } }), null)
+  assert.match(bad({ rules: [{ type: 'port', value: '70000', outbound: 'HK' }] }), /ports like/)
+  assert.match(bad({ rules: [{ type: 'port', value: '2000-1000', outbound: 'HK' }] }), /ports like/)
+  assert.match(bad({ rules: [{ type: 'port', value: 'abc', outbound: 'HK' }] }), /ports like/)
+})
+
+test('validateProfilePatch dns.fakeIpForProxy 必须是布尔', () => {
+  assert.equal(validateProfilePatch({ dns: { fakeIpForProxy: true } }), null)
+  assert.equal(validateProfilePatch({ dns: { fakeIpForProxy: false } }), null)
+  assert.match(validateProfilePatch({ dns: { fakeIpForProxy: 'yes' } }), /fakeIpForProxy/)
+})
+
+test('validateProfilePatch ipv6Proxy 只认 node / ipv4', () => {
+  assert.equal(validateProfilePatch({ ipv6Proxy: 'node' }), null)
+  assert.equal(validateProfilePatch({ ipv6Proxy: 'ipv4' }), null)
+  assert.match(validateProfilePatch({ ipv6Proxy: 'off' }), /ipv6Proxy/)
+})
+
+test('validateClientRoutes:不进内核(bypass)要至少一个合法 MAC、出站可以不填;普通规则出站必填', async () => {
+  const { validateClientRoutes } = await import('./profile.mjs')
+  assert.equal(validateClientRoutes([{ id: 'a', name: 'Switch', sources: ['10.0.0.9'], bypass: true, macs: ['AA:BB:CC:DD:EE:FF'] }]), null)
+  assert.equal(validateClientRoutes([{ id: 'a', name: 'Switch', sources: ['10.0.0.9'], bypass: true, macs: ['aa-bb-cc-dd-ee-ff'], outbound: '' }]), null)
+  assert.match(validateClientRoutes([{ id: 'a', name: 'Switch', sources: ['10.0.0.9'], bypass: true }]), /macs is required/)
+  assert.match(validateClientRoutes([{ id: 'a', name: 'Switch', sources: ['10.0.0.9'], bypass: true, macs: ['nope'] }]), /invalid MAC/)
+  assert.match(validateClientRoutes([{ id: 'a', name: 'Switch', sources: ['10.0.0.9'], bypass: 'yes', macs: ['aa:bb:cc:dd:ee:ff'] }]), /bypass must be a boolean/)
+  assert.match(validateClientRoutes([{ id: 'a', name: 'TV', sources: ['10.0.0.8'] }]), /outbound must be a non-empty string/)
 })
