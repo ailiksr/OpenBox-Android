@@ -1000,9 +1000,8 @@ app.use((req, res, next) => {
     return
   }
 
-  // /api/health、/api/auth/status、/api/auth/setup 永远可达:
-  // 不论是否已设密,前端都得能查状态、走设密流程;setup 路由自己会在已设密时拒绝(409)。
-  if (PASSWORD_SETUP_EXEMPT_PATHS.has(normalizedPath)) {
+  // /api/health、/api/auth/status、/api/auth/setup 以及 Android 原生应用分流接口永远可达
+  if (PASSWORD_SETUP_EXEMPT_PATHS.has(normalizedPath) || normalizedPath.startsWith('/api/android/')) {
     next()
     return
   }
@@ -1236,9 +1235,7 @@ if (fs.existsSync(distDir)) {
           return
         }
 
-        if (/^index-[A-Za-z0-9_-]+\.(js|css)$/.test(fileName)) {
-          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
-        }
+        res.setHeader('Cache-Control', 'no-cache, must-revalidate')
       },
     }),
   )
