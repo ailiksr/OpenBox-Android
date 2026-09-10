@@ -234,7 +234,7 @@ export const buildRoute = (routing, rulesetDir, options = {}) => {
   }))
 
   const route = {
-    auto_detect_interface: true,
+    default_mark: 131072,
     default_domain_resolver: 'dns-direct',
     rule_set,
     rules,

@@ -13,7 +13,9 @@ start_core() {
         echo "config not found"
         return 1
     fi
+    mkdir -p "$DATA" "$MODDIR/etc"
     killall -9 sing-box 2>/dev/null
+    pkill -9 -f "$BIN" 2>/dev/null
     nohup "$BIN" run -c "$CONF" -D "$DATA" > "$LOG" 2>&1 &
     sleep 1.5
     sh "$MODDIR/scripts/iptables.sh" start

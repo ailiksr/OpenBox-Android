@@ -22,5 +22,5 @@ export const createPaths = (root = process.env.OPENBOX_ROOT || '/data/adb/module
   updateLogPath: '/tmp/openbox-update.log',
   geoUpdateStatePath: `${root}/data/geo-update.json`,
   scheduleStatePath: `${root}/data/schedule-state.json`,
-  initd: { core: '/etc/init.d/openbox', panel: '/etc/init.d/openbox-panel' },
+  initd: { core: `${root}/scripts/service-core.sh`, panel: `${root}/scripts/service-panel.sh` },
 })

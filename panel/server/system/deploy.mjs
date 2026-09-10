@@ -1,3 +1,4 @@
+import fs from 'node:fs'
 import { filterForwardPlan, filterKey, filterSettings } from '../engine/dns-filter.mjs'
 import { detectConflicts } from './conflicts.mjs'
 import { validateConfigObject, attributeBadNodes } from './validate.mjs'
@@ -37,9 +38,10 @@ export const rollbackToDirect = async (ctx, paths) => {
     }
   }
   await step('stop-core', () => stopService(ctx, paths.initd.core))
-  await step('restore-dns', () => restoreDnsTakeover(ctx, paths))
-  // 只撤代理相关规则,不删面板 LAN 放行——否则回滚会把用户返回恢复界面的路都堵死。
-  await step('remove-firewall', () => removeProxyRules(ctx))
+  if (fs.existsSync('/sbin/uci')) {
+    await step('restore-dns', () => restoreDnsTakeover(ctx, paths))
+    await step('remove-firewall', () => removeProxyRules(ctx))
+  }
   return { ok: failures.length === 0, actions, failures }
 }
 
@@ -57,8 +59,16 @@ const detachedSleep = (ms) => new Promise((resolve) => { const t = setTimeout(re
 
 // 内核起来又死了的时候,把它最后一句 FATAL 带回界面——"内核启动后未在运行"这句话
 // 本身什么都说明不了,用户还得自己去翻 logread。读不到就是空串。
-const readLastKernelFatal = async (ctx) => {
+const readLastKernelFatal = async (ctx, paths) => {
   try {
+    if (paths && paths.dataDir) {
+      const logFile = `${paths.dataDir}/singbox.log`
+      if (await ctx.exists(logFile)) {
+        const content = await ctx.readFile(logFile)
+        const fatal = String(content).split('\n').filter((line) => /FATAL/.test(line)).pop()
+        if (fatal) return fatal.replace(/\x1b\[[0-9;]*m/g, '')
+      }
+    }
     const { code, stdout } = await ctx.exec('logread', ['-e', 'sing-box'])
     if (code !== 0 || !stdout) return ''
     const fatal = stdout.split('\n').filter((line) => /FATAL/.test(line)).pop()
@@ -218,35 +228,25 @@ export const deployConfig = async (ctx, paths, { config, profile, userGroups, fe
     }
     await writeConfigAndMeta(config)
 
-    // 5. DNS 接管
-    if (dnsMode !== 'dnsmasq' && (await ctx.exists(dnsTakeoverBackupPath(paths)))) {
-      // 上次部署用了 dnsmasq 接管、这次切回 hijack(或其它非 dnsmasq 模式):
-      // 若不先还原,dnsmasq 会继续指向 127.0.0.1#7853,而新配置已无 dns-in 入站,
-      // LAN DNS 全断却仍报部署成功。备份是否存在的判断与 Critical 2 的回滚修复共用。
-      await restoreDnsTakeover(ctx, paths)
+    // 5. DNS 接管 & 6. 防火墙 (仅在存在 uci 的 OpenWrt 路由器上执行, Android 下完全由 iptables.sh 统一接管)
+    if (fs.existsSync('/sbin/uci')) {
+      if (dnsMode !== 'dnsmasq' && (await ctx.exists(dnsTakeoverBackupPath(paths)))) {
+        await restoreDnsTakeover(ctx, paths)
+      }
+      const applied = await applyDnsTakeover(ctx, paths, { mode: dnsMode, forward: dnsForward, rewriteSources: enabledRewriteSources(dnsRewrite) })
+      if (dnsMode === 'dnsmasq' && applied.effective && applied.effective.mode !== dnsForward.mode) {
+        dnsForward = { ...dnsForward, ...applied.effective, expanded: [], superset: [] }
+        await writeConfigAndMeta(config)
+      }
+      const firewall = [
+        await applyPanelLanRule(ctx, { port: 2026, commit: false }),
+        await applyDnsLanRule(ctx, { port: 7853, commit: false }),
+        await applyIpv6Block(ctx, { enabled: profile.ipv6 === false, commit: false }),
+        await applyServerPortRules(ctx, enabledServers(profile.servers), { commit: false }),
+      ]
+      if (firewall.some((r) => r.changed)) await commitFirewall(ctx)
     }
-    // 代理面能被逐条列出来时,只把那几个域名转给内核,其余交回路由器自己解析——
-    // 直连的 DNS 就真的不经过 Open-Box 了。列不出来就照旧全局转发。
-    // 成员表从刚生成的配置里取(兜底 selector 的成员就是那一份),不另算一遍。
-    const applied = await applyDnsTakeover(ctx, paths, { mode: dnsMode, forward: dnsForward, rewriteSources: enabledRewriteSources(dnsRewrite) })
-    // 应用阶段又降级了(计划阶段本该拦住,这是最后一道):元数据必须记实际执行的,重写一遍
-    if (dnsMode === 'dnsmasq' && applied.effective && applied.effective.mode !== dnsForward.mode) {
-      dnsForward = { ...dnsForward, ...applied.effective, expanded: [], superset: [] }
-      await writeConfigAndMeta(config)
-    }
-    mark('DNS 接管')
-
-    // 6. 防火墙:四条规则各自对齐到目标状态,只要有一条真变了才 commit + reload,且只一次。
-    // fw4 reload 在规则多的路由器上一次好几秒,以前每条规则各 reload 一遍,一次部署要等十几秒。
-    const firewall = [
-      await applyPanelLanRule(ctx, { port: 2026, commit: false }),
-      // 内核 DNS 入站 :7853 只放行 LAN(config.mjs 的 dns-in)
-      await applyDnsLanRule(ctx, { port: 7853, commit: false }),
-      await applyIpv6Block(ctx, { enabled: profile.ipv6 === false, commit: false }),
-      // 共享网络:从 WAN 放行各服务器的端口(局域网本来就能到路由器)
-      await applyServerPortRules(ctx, enabledServers(profile.servers), { commit: false }),
-    ]
-    if (firewall.some((r) => r.changed)) await commitFirewall(ctx)
+    mark('DNS 与防火墙接管')
     mark('防火墙')
 
     // DNS / 防火墙已经按新配置改了,内核还没起:被停止取消就回滚到直连,不能留着半接管的状态
@@ -263,16 +263,16 @@ export const deployConfig = async (ctx, paths, { config, profile, userGroups, fe
       const rb = await rollbackToDirect(ctx, paths)
       return { ok: false, stage: 'start', message: `sing-box 二进制或配置文件缺失,${rollbackSummary(rb)}`, rollback: rb }
     }
-    // tun 设备:有的固件没装 / 没加载 tun 模块(GitHub #12,内核 FATAL "open /dev/net/tun:
-    // no such file or directory")。先试着加载一次,还没有就明说要装 kmod-tun,别让用户
-    // 对着内核的英文报错猜。
-    if (!(await ctx.exists(TUN_DEVICE))) {
-      await ctx.exec('modprobe', ['tun'])
+    // tun 设备 (仅在 OpenWrt 环境下检查, Android 使用 redirect/tproxy 不依赖 tun 模块)
+    if (fs.existsSync('/sbin/uci')) {
       if (!(await ctx.exists(TUN_DEVICE))) {
-        const rb = await rollbackToDirect(ctx, paths)
-        return {
-          ok: false, stage: 'start', rollback: rb,
-          message: `系统没有 tun 设备(${TUN_DEVICE} 不存在),内核起不来。请安装 kmod-tun(opkg install kmod-tun)后重试。${rollbackSummary(rb)}`,
+        await ctx.exec('modprobe', ['tun'])
+        if (!(await ctx.exists(TUN_DEVICE))) {
+          const rb = await rollbackToDirect(ctx, paths)
+          return {
+            ok: false, stage: 'start', rollback: rb,
+            message: `系统没有 tun 设备(${TUN_DEVICE} 不存在),内核起不来。请安装 kmod-tun(opkg install kmod-tun)后重试。${rollbackSummary(rb)}`,
+          }
         }
       }
     }
@@ -305,7 +305,7 @@ export const deployConfig = async (ctx, paths, { config, profile, userGroups, fe
       }
       if (!crashed) break
 
-      const fatal = await readLastKernelFatal(ctx)
+      const fatal = await readLastKernelFatal(ctx, paths)
       if (autoRedirect && !redirectFallbackTried && typeof rebuild === 'function' && AUTO_REDIRECT_FATAL.test(fatal)) {
         // nftables 那层起不来:关掉 auto_redirect 重新生成配置(排除表、DNS 改写都跟着变,
         // 不能只把字段删掉),再起一次。只试一次,再崩就按普通崩溃处理
@@ -328,7 +328,7 @@ export const deployConfig = async (ctx, paths, { config, profile, userGroups, fe
         await sleep(wait)
         if (isStale() || isCancelled()) return null
         if ((await serviceStatus(ctx, paths.initd.core)).running) continue
-        const fatal = await readLastKernelFatal(ctx)
+        const fatal = await readLastKernelFatal(ctx, paths)
         if (autoRedirect && !redirectFallbackTried && typeof rebuild === 'function' && AUTO_REDIRECT_FATAL.test(fatal)) {
           redirectFallbackTried = true
           autoRedirect = false

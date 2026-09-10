@@ -1,5 +1,5 @@
 const runAction = async (ctx, initdPath, action) => {
-  const { code, stdout, stderr } = await ctx.exec(initdPath, [action])
+  const { code, stdout, stderr } = await ctx.exec('sh', [initdPath, action])
   return { ok: code === 0, code, stdout, stderr }
 }
 
@@ -10,7 +10,7 @@ export const enableService = (ctx, initdPath) => runAction(ctx, initdPath, 'enab
 export const disableService = (ctx, initdPath) => runAction(ctx, initdPath, 'disable')
 
 export const serviceStatus = async (ctx, initdPath) => {
-  const { code, stdout, stderr } = await ctx.exec(initdPath, ['status'])
+  const { code, stdout, stderr } = await ctx.exec('sh', [initdPath, 'status'])
   const raw = `${stdout}${stderr}`
   // procd 对"已注册但零进程实例"(如内核崩溃后放弃重启)会报 "active with no instances",
   // 这类文本含 "active" 但不代表真的在跑;必须要求出现 "running" 且不含 "no instances"。
@@ -20,7 +20,7 @@ export const serviceStatus = async (ctx, initdPath) => {
 
 // 开机自启是否已开启:procd 脚本的 `enabled` 子命令,开着退出码 0。
 export const serviceEnabled = async (ctx, initdPath) => {
-  const { code } = await ctx.exec(initdPath, ['enabled'])
+  const { code } = await ctx.exec('sh', [initdPath, 'enabled'])
   return code === 0
 }
 

@@ -41,8 +41,8 @@ wait_until_ready() {
     # 1. 启动 WebUI 后端面板
     sh "$SCRIPTS_DIR/service-panel.sh" start
 
-    # 2. 检查开机自启标志与配置，启动 sing-box 内核与透明代理
-    if [ -f "$MODDIR/data/autostart" ] && [ -f "$MODDIR/etc/config.json" ]; then
+    # 2. 检查配置，启动 sing-box 内核与透明代理 (开机自启)
+    if [ -f "$MODDIR/etc/config.json" ] && [ ! -f "$MODDIR/data/disabled" ]; then
         sh "$SCRIPTS_DIR/service-core.sh" start
     fi
 

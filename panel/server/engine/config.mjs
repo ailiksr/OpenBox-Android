@@ -72,7 +72,8 @@ export const DNSMASQ_OUTBOUND_TAG = 'dnsmasq'
 // 系统解析器,会绕回 dnsmasq 形成死循环。预览/测试不传就回落到档案里填的那台。
 // regionGroups 参数已经退役(以前按国家自动分的 urltest 组 + 一个 PROXY 聚合 selector,
 // 那是节点组功能出现之前的东西);留着这个参数名只是让老调用方不报错。
-export const buildConfig = ({ nodes, profile, userGroups, systemDns, localSubnets = [], directHostCidrs = [], subscriptions = [], ruleLists = {}, cacheFilePath = '/opt/open-box/data/cache.db', selections = {}, tlsCert = { certPath: '/opt/open-box/etc/certs/server.crt', keyPath: '/opt/open-box/etc/certs/server.key' }, nativeBypass, dnsFilter }) => {
+const defaultRoot = process.env.OPENBOX_ROOT || '/data/adb/modules/openbox_android'
+export const buildConfig = ({ nodes, profile, userGroups, systemDns, localSubnets = [], directHostCidrs = [], subscriptions = [], ruleLists = {}, cacheFilePath = `${defaultRoot}/data/cache.db`, selections = {}, tlsCert = { certPath: `${defaultRoot}/etc/certs/server.crt`, keyPath: `${defaultRoot}/etc/certs/server.key` }, nativeBypass, dnsFilter }) => {
   // 订阅和节点站点直连(默认开):见 engine/direct-hosts.mjs
   // directHostCidrs:部署时把节点域名解析出来的 IP(见 system/resolve-hosts.mjs),让按裸 IP
   // 直连节点服务器的客户端(SSH 等)也能命中直连规则;预览接口没有这份,只按域名匹配。
@@ -247,7 +248,19 @@ export const buildConfig = ({ nodes, profile, userGroups, systemDns, localSubnet
 
   // 面板「真实路由」测试用的回环入站:面板进程经它发请求,请求才会真的走内核的分流
   // (路由器自身发出的流量不一定进 tun)。只听 127.0.0.1,外面碰不到。
-  const inbounds = [tunInbound, { type: 'mixed', tag: PANEL_INBOUND_TAG, listen: '127.0.0.1', listen_port: PANEL_INBOUND_PORT }]
+    const tproxyInbound = {
+    type: 'tproxy',
+    tag: 'tproxy-in',
+    listen: '0.0.0.0',
+    listen_port: 7895,
+  }
+  const redirectInbound = {
+    type: 'redirect',
+    tag: 'redirect-in',
+    listen: '0.0.0.0',
+    listen_port: 7892,
+  }
+  const inbounds = [tproxyInbound, redirectInbound, { type: 'mixed', tag: PANEL_INBOUND_TAG, listen: '127.0.0.1', listen_port: PANEL_INBOUND_PORT }]
   // 内核 DNS 入站 :7853,三种模式都开、监听所有地址(防火墙只放行 LAN,见 system/firewall.mjs):
   // dnsmasq 模式下 dnsmasq 的上游指向它;局域网里的 AdGuard Home / Pi-hole 也可以把上游指向
   // <路由器 IP>:7853 用内核的分流解析——尤其是「禁用」模式,不劫持任何 DNS,但把入口留着。
