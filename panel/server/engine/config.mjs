@@ -125,7 +125,7 @@ export const buildConfig = ({ nodes, profile, userGroups, systemDns, localSubnet
   // "悬空目标重映射"那套——真正可能悬空的是 selector 的 default,已经在生成时挡掉了。
   const sanitizedRouting = routingConf
 
-  const dnsMode = (profile.dns && profile.dns.mode) || 'hijack'
+  const dnsMode = 'hijack'
   if (dnsMode === 'dnsmasq') {
     // 绑定 lo 才拨得通 127.0.0.1(auto_detect_interface 对写了 bind_interface 的出站不生效)
     outbounds.push({ type: 'direct', tag: DNSMASQ_OUTBOUND_TAG, bind_interface: 'lo' })

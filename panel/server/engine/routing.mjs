@@ -125,15 +125,9 @@ export const buildRoute = (routing, rulesetDir, options = {}) => {
   // (配合 config.mjs 里关掉 auto_redirect,它自带 nft 层的 DNS 劫持,关不掉)。但内核 DNS 入站
   // dns-in 仍开着,主动发到 <路由器 IP>:7853 的查询(AdGuard Home / Pi-hole 的上游)照常解析。
   // hijack 模式靠 {protocol:'dns'} 一并接住 dns-in 收到的查询(sniff 对 direct 入站同样生效)。
-  if (dnsMode === 'hijack') {
-    rules.push({ protocol: 'dns', action: 'hijack-dns' })
-  } else if (dnsMode === 'off') {
-    rules.push({ inbound: ['dns-in'], action: 'hijack-dns' })
-  } else if (dnsMode === 'dnsmasq') {
-    // dnsmasq 接管模式下不能全局劫持 DNS 协议流量:tun 里到 dns-in 的转发查询也会
-    // 匹配 {protocol:'dns'},被劫持回同一个 dns-in 入站,形成自环导致解析超时。
-    // 仅劫持 dns-in 自身收到的查询,其余 DNS 流量按普通路由走(交给 dnsmasq 上游)。
-    rules.push({ inbound: ['dns-in'], action: 'hijack-dns' })
+  // Android 环境下始终执行全局 DNS 协议与 53 端口强制劫持
+  rules.push({ protocol: 'dns', action: 'hijack-dns' })
+  rules.push({ port: [53], action: 'hijack-dns' })
     // sing-box 开了 auto_redirect 时会自带一条 nft DNAT:局域网发给任何 53 端口的查询
     // (包括发给路由器自己 dnsmasq 的)统统改写到 tun 对端 172.19.0.2:53 送进 tun。
     // hijack 模式靠 {protocol:'dns'} 把它们接住;dnsmasq 模式只劫持 dns-in,这些查询会
@@ -148,7 +142,6 @@ export const buildRoute = (routing, rulesetDir, options = {}) => {
         outbound: options.dnsmasqTag, override_address: '127.0.0.1',
       })
     }
-  }
   // 防回环:目标是 tun 自己的网段(172.19.0.0/30 等)的连接直接拒绝。tun 的对端地址
   // 172.19.0.2 只是路由下一跳,没有任何合法流量会以它为目标;可一旦有(真机上出现过
   // 对 172.19.0.2:53 的 TCP DNS 查询),ip_is_private 会把它交给直连出站,直连再拨
