@@ -1,4 +1,5 @@
 import dns from 'node:dns'
+import dnsPromises from 'node:dns/promises'
 import net from 'node:net'
 
 export const setupAndroidDns = () => {
@@ -18,7 +19,7 @@ export const setupAndroidDns = () => {
       opts = {}
     }
 
-    if (net.isIP(hostname)) {
+    if (!hostname || net.isIP(hostname)) {
       return origLookup.call(dns, hostname, opts, cb)
     }
 
@@ -51,5 +52,12 @@ export const setupAndroidDns = () => {
     })
   }
 
+  if (dnsPromises) {
+    dnsPromises.lookup = dns.promises.lookup
+  }
+
   console.log('[android-dns] Android DNS polyfill initialized (AliDNS / TencentDNS / GoogleDNS)')
 }
+
+// 自动在模块载入时立即执行初始化，确保系统全局生效！
+setupAndroidDns()
