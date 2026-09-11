@@ -142,7 +142,7 @@ export const ensureRulesets = async (ctx, config, { fetchImpl = globalThis.fetch
   // 不在 MetaCubeX 上,拿它的名字去那边找必然 404。只跳过这一种——其余认不出前缀的名字
   // 仍然要走下面的报错路径(路径穿越那道闸也在那儿)。
   const local = entries.filter(
-    (e) => e && e.type === 'local' && e.tag && e.path && !isRuleListTag(e.tag),
+    (e) => e && e.type === 'local' && e.tag && e.path && rulesetKind(e.tag),
   )
   if (!local.length) return { ok: true, downloaded: [] }
 

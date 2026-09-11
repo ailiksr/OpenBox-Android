@@ -1,4 +1,5 @@
 import './system/android-dns.mjs'
+import { proxyFetch } from './system/proxy-fetch.mjs'
 import { registerAndroidAppRoutes } from './api/android-apps.mjs'
 import express from 'express'
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
@@ -1107,11 +1108,11 @@ registerAndroidAppRoutes(app, { paths: obPaths, ctx: obCtx })
 registerProfileRoutes(app, { store })
 registerDeployRoutes(app, { store, ctx: obCtx, paths: obPaths })
 registerServiceRoutes(app, { store, ctx: obCtx, paths: obPaths })
-registerRulesetRoutes(app, { store, ctx: obCtx, paths: obPaths, fetchImpl: globalThis.fetch })
+registerRulesetRoutes(app, { store, ctx: obCtx, paths: obPaths, fetchImpl: proxyFetch })
 registerPenetrationRoutes(app, { store, ctx: obCtx, paths: obPaths, fetchImpl: globalThis.fetch })
 registerNodeLatencyRoutes(app, { ctx: obCtx, paths: obPaths, store, fetchImpl: globalThis.fetch })
 registerGroupRoutes(app, { store })
-registerUpdateRoutes(app, { store, ctx: obCtx, paths: obPaths, fetchImpl: globalThis.fetch })
+registerUpdateRoutes(app, { store, ctx: obCtx, paths: obPaths, fetchImpl: proxyFetch })
 registerRouteTestRoutes(app, { store, ctx: obCtx, paths: obPaths, fetchImpl: globalThis.fetch })
 registerTerminalTestRoutes(app, { store, ctx: obCtx, paths: obPaths, fetchImpl: globalThis.fetch })
 // 每日流量:面板常驻读内核连接表,按天/节点/域名把字节数记进 cache.db(system/traffic-collector.mjs);

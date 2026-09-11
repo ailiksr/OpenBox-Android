@@ -3,7 +3,7 @@
 // 升级本身交给随包发布的 scripts/update.sh(--detach 后台跑、--cancel 协作式取消、
 // /tmp/openbox-update.status 报进度),面板只负责:读版本、探最新版、发起/取消、
 // 读进度。这样 LuCI 兜底页和面板用的是同一条升级路径,不会各有一套坑。
-import { downloadRuleset, RULESET_MIRRORS, SOURCE_MARKER, RULESET_SOURCE } from './rulesets.mjs'
+import { downloadRuleset, RULESET_MIRRORS, SOURCE_MARKER, RULESET_SOURCE, rulesetKind } from './rulesets.mjs'
 import { isRuleListTag } from '../engine/rule-list.mjs'
 
 export const REPO = 'liandu2024/Open-Box'
@@ -221,7 +221,7 @@ export const refreshRulesets = async (ctx, paths, { fetchImpl = globalThis.fetch
   // 只管 Geo 那几份(geoip-* / geosite-*)。list-* 是「规则集链接」:由 system/rule-lists.mjs 从
   // 用户填的网址下载、编译,不在 MetaCubeX 上——部署路径(rulesets.mjs 的 ensureRulesets)早就
   // 跳过了它,这条更新路径以前漏了,每次 Geo 更新都给它记一条"只认识 geoip-/geosite- 前缀"的失败。
-  const entries = ((config.route && config.route.rule_set) || []).filter((e) => e && e.type === 'local' && e.tag && e.path && !isRuleListTag(e.tag))
+  const entries = ((config.route && config.route.rule_set) || []).filter((e) => e && e.type === 'local' && e.tag && e.path && rulesetKind(e.tag))
   const mirrors = geoSources(channel, await readChannel(ctx, paths))
   let versions = latest && typeof latest === 'object' ? { ...latest } : null
   if (!versions) {
@@ -234,12 +234,17 @@ export const refreshRulesets = async (ctx, paths, { fetchImpl = globalThis.fetch
   const updated = []
   const failed = []
   const blobs = []
-  for (const entry of entries) {
-    try {
-      blobs.push([entry, await downloadRuleset(fetchImpl, entry.tag, { mirrors })])
-    } catch (err) {
-      failed.push({ tag: entry.tag, message: err instanceof Error ? err.message : String(err) })
-    }
+  const CONCURRENCY = 4
+  for (let i = 0; i < entries.length; i += CONCURRENCY) {
+    const batch = entries.slice(i, i + CONCURRENCY)
+    await Promise.all(batch.map(async (entry) => {
+      try {
+        const data = await downloadRuleset(fetchImpl, entry.tag, { mirrors })
+        blobs.push([entry, data])
+      } catch (err) {
+        failed.push({ tag: entry.tag, message: err instanceof Error ? err.message : String(err) })
+      }
+    }))
   }
   for (const [entry, data] of blobs) {
     const dir = entry.path.slice(0, entry.path.lastIndexOf('/'))
