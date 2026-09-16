@@ -89,7 +89,7 @@ test('POST /update/run:已有更新在跑 → 409', async () => {
 test('POST /rulesets/refresh:配置里一个 Geo 规则集都没有(新装机内核没成功部署过)→ nothing + 说明,不报"已更新 0 个"(GitHub #20)', async () => {
   const ctx = createMockContext({
     files: { [paths.configPath]: JSON.stringify({ route: { rule_set: [] } }) },
-    execResults: { '/etc/init.d/openbox status': { code: 1, stdout: 'inactive' } },
+    execResults: { 'sh /opt/open-box/scripts/service-core.sh status': { code: 1, stdout: 'inactive' } },
   })
   const { base, close } = await startApp(ctx, { getProfile: () => ({}) }, async () => ({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1]).buffer }))
   try {
@@ -110,7 +110,7 @@ test('POST /rulesets/refresh:按配置里的本地规则集重新下载,记录�
   ] } }
   const ctx = createMockContext({
     files: { [paths.configPath]: JSON.stringify(config) },
-    execResults: { '/etc/init.d/openbox status': { code: 1, stdout: 'inactive' } },
+    execResults: { 'sh /opt/open-box/scripts/service-core.sh status': { code: 1, stdout: 'inactive' } },
   })
   const fetchImpl = async () => ({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer })
   const { base, close } = await startApp(ctx, { getProfile: () => ({}) }, fetchImpl)
@@ -168,7 +168,7 @@ test('POST /rulesets/refresh {channel:mirror}:只走镜像下载,并把上游 ta
   ] } }
   const ctx = createMockContext({
     files: { [paths.configPath]: JSON.stringify(config), [paths.channelPath]: 'mirror\nhttps://gh-proxy.com/\n' },
-    execResults: { '/etc/init.d/openbox status': { code: 1, stdout: 'inactive' } },
+    execResults: { 'sh /opt/open-box/scripts/service-core.sh status': { code: 1, stdout: 'inactive' } },
   })
   const urls = []
   const { base, close } = await startApp(ctx, { getProfile: () => ({}) }, geoFetch(undefined, urls))
@@ -192,7 +192,7 @@ test('定时器:到点且未做过 → 先探上游,有新版才下并记录;同
   const config = { route: { rule_set: [{ type: 'local', tag: 'geosite-cn', path: `${paths.rulesetDir}/geosite-cn.srs` }] } }
   const ctx = createMockContext({
     files: { [paths.configPath]: JSON.stringify(config) },
-    execResults: { '/etc/init.d/openbox status': { code: 1, stdout: 'inactive' } },
+    execResults: { 'sh /opt/open-box/scripts/service-core.sh status': { code: 1, stdout: 'inactive' } },
   })
   const urls = []
   const fetchImpl = geoFetch(undefined, urls)
@@ -286,7 +286,7 @@ test('定时器:订阅到点自动重拉;同一天不重复、没到 N 天不拉
   store.setProfile({ updates: { geo: { auto: false }, openbox: { auto: false } } })
   store.setSubscriptions([{ id: 's1', name: 'A', url: 'http://a', urls: ['http://a'], format: 'sharelink', nodeCount: 0, renameOptions: {}, autoUpdate: { enabled: true, days: 3, hour: 4 }, createdAt: 1, updatedAt: 1 }])
   store.setNodes([])
-  const ctx = createMockContext({ execResults: { '/etc/init.d/openbox status': { code: 0, stdout: 'running' } } })
+  const ctx = createMockContext({ execResults: { 'sh /opt/open-box/scripts/service-core.sh status': { code: 0, stdout: 'running' } } })
   let fetched = 0
   const subscriptionFetchImpl = async () => { fetched += 1; return { ok: true, status: 200, text: async () => 'ss://YWVzLTI1Ni1nY206c2VjcmV0cHc=@example.com:8388#HK-01' } }
   const deploys = []

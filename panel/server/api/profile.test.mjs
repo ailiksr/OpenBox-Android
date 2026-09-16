@@ -205,7 +205,7 @@ test('PUT 只碰 ipv6 的部分 patch 不因缺 dns 报错,且不影响 dns', as
     assert.equal(res.status, 200)
     const body = await res.json()
     assert.equal(body.profile.ipv6, false)
-    assert.equal(body.profile.dns.mode, 'dnsmasq') // 未提及,保留默认
+    assert.equal(body.profile.dns.mode, 'hijack') // 未提及,保留默认(Android 版默认 hijack,红线 6)
   } finally {
     await close()
   }

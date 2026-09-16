@@ -24,7 +24,7 @@ const cmds = (ctx) => ctx.calls.map((c) => [c.cmd, ...c.args].join(' '))
 const okCtx = (over = {}) => createMockContext({
   files: { [paths.singbox]: '#!/bin/sh\n', [TUN_DEVICE]: '' },
   execResults: {
-    '/etc/init.d/openbox status': { code: 0, stdout: 'running' },
+    'sh /opt/open-box/scripts/service-core.sh status': { code: 0, stdout: 'running' },
     ...over,
   },
 })
@@ -103,7 +103,7 @@ test('POST /api/openbox/deploy 成功路径 → 200,持久化部署态,内核开
 
     assert.equal(store.getDeployState().stage, 'running') // 结果已落库
 
-    assert.ok(cmds(ctx).includes('/etc/init.d/openbox enable')) // P3 遗留项:开机自启
+    assert.ok(cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh enable')) // P3 遗留项:开机自启
   } finally {
     await close()
   }
@@ -118,7 +118,8 @@ test('POST /api/openbox/deploy 部署成功但 enableService 抛错 → 响应�
   const ctx = okCtx()
   const originalExec = ctx.exec.bind(ctx)
   ctx.exec = async (cmd, args = []) => {
-    if (args[0] === 'enable') {
+    // Android 调用形如 `sh <service-core.sh> enable`,动作在最后一个参数
+    if (args[args.length - 1] === 'enable') {
       throw new Error('enable failed: procd communication error')
     }
     return originalExec(cmd, args)
@@ -145,7 +146,8 @@ test('POST /api/openbox/rollback 中 disableService 抛错 → 500 JSON(handler 
   const ctx = createMockContext({ defaultExec: { code: 0 } })
   const originalExec = ctx.exec.bind(ctx)
   ctx.exec = async (cmd, args = []) => {
-    if (args[0] === 'disable') {
+    // Android 调用形如 `sh <service-core.sh> disable`,动作在最后一个参数
+    if (args[args.length - 1] === 'disable') {
       throw new Error('disable failed: procd communication error')
     }
     return originalExec(cmd, args)
@@ -164,9 +166,10 @@ test('POST /api/openbox/rollback 中 disableService 抛错 → 500 JSON(handler 
 })
 
 test('POST /api/openbox/deploy 冲突路径 → 409,未写任何文件,不 enable/disable', async () => {
+  // serviceStatus 走 `sh <脚本> status`,mock 键要带 sh 前缀
   const ctx = createMockContext({
     files: { '/etc/init.d/openclash': '#!' },
-    execResults: { '/etc/init.d/openclash status': { code: 0, stdout: 'running' } },
+    execResults: { 'sh /etc/init.d/openclash status': { code: 0, stdout: 'running' } },
   })
   const { baseUrl, store, close } = await startApp(ctx)
   try {
@@ -181,8 +184,8 @@ test('POST /api/openbox/deploy 冲突路径 → 409,未写任何文件,不 enabl
     assert.equal(store.getDeployState().stage, 'conflict')
     // 失败且内核没在跑(这里没 mock status → 视为没跑)→ 和「停止」一样关掉开机自启,
     // 不能留着一份没验证过的配置等下次开机被 procd 拉起
-    assert.ok(!cmds(ctx).some((c) => c.includes('/etc/init.d/openbox enable')))
-    assert.ok(cmds(ctx).some((c) => c.includes('/etc/init.d/openbox disable')))
+    assert.ok(!cmds(ctx).some((c) => c.includes('sh /opt/open-box/scripts/service-core.sh enable')))
+    assert.ok(cmds(ctx).some((c) => c.includes('sh /opt/open-box/scripts/service-core.sh disable')))
   } finally {
     await close()
   }
@@ -202,11 +205,11 @@ test('POST /api/openbox/deploy 校验失败 → 409,给 badTags,不写正式配�
     assert.deepEqual(body.badTags, ['HK-01'])
 
     assert.ok(!ctx.writes.some((w) => w.path === paths.configPath)) // 未写正式配置
-    assert.ok(!cmds(ctx).some((c) => c.includes('/etc/init.d/openbox restart')))
+    assert.ok(!cmds(ctx).some((c) => c.includes('sh /opt/open-box/scripts/service-core.sh restart')))
     // 失败且内核没在跑(这里没 mock status → 视为没跑)→ 和「停止」一样关掉开机自启,
     // 不能留着一份没验证过的配置等下次开机被 procd 拉起
-    assert.ok(!cmds(ctx).some((c) => c.includes('/etc/init.d/openbox enable')))
-    assert.ok(cmds(ctx).some((c) => c.includes('/etc/init.d/openbox disable')))
+    assert.ok(!cmds(ctx).some((c) => c.includes('sh /opt/open-box/scripts/service-core.sh enable')))
+    assert.ok(cmds(ctx).some((c) => c.includes('sh /opt/open-box/scripts/service-core.sh disable')))
     assert.equal(store.getDeployState().stage, 'validate')
   } finally {
     await close()
@@ -216,7 +219,7 @@ test('POST /api/openbox/deploy 校验失败 → 409,给 badTags,不写正式配�
 test('POST /api/openbox/deploy 校验失败但旧内核还在跑(比如点的是重启)→ 不动开机自启', async () => {
   const ctx = createMockContext({
     defaultExec: { code: 1, stderr: 'FATAL: unknown method: x' },
-    execResults: { '/etc/init.d/openbox status': { code: 0, stdout: 'running' } },
+    execResults: { 'sh /opt/open-box/scripts/service-core.sh status': { code: 0, stdout: 'running' } },
   })
   const store = memStore()
   store.setNodes([BAD_NODE])
@@ -224,7 +227,7 @@ test('POST /api/openbox/deploy 校验失败但旧内核还在跑(比如点的是
   try {
     const res = await fetch(`${baseUrl}/api/openbox/deploy`, { method: 'POST' })
     assert.equal(res.status, 409)
-    assert.ok(!cmds(ctx).some((c) => c.includes('/etc/init.d/openbox enable') || c.includes('/etc/init.d/openbox disable')))
+    assert.ok(!cmds(ctx).some((c) => c.includes('sh /opt/open-box/scripts/service-core.sh enable') || c.includes('sh /opt/open-box/scripts/service-core.sh disable')))
   } finally {
     await close()
   }
@@ -234,7 +237,7 @@ test('POST /api/openbox/deploy 重启失败 → 500,回滚命令出现,disable �
   const ctx = createMockContext({
     files: { [paths.singbox]: '#!/bin/sh\n', [TUN_DEVICE]: '' },
     execResults: {
-      '/etc/init.d/openbox restart': { code: 1, stderr: 'start failed' },
+      'sh /opt/open-box/scripts/service-core.sh restart': { code: 1, stderr: 'start failed' },
     },
   })
   const { baseUrl, store, close } = await startApp(ctx)
@@ -246,9 +249,9 @@ test('POST /api/openbox/deploy 重启失败 → 500,回滚命令出现,disable �
     assert.equal(body.stage, 'start')
 
     const c = cmds(ctx)
-    assert.ok(c.includes('/etc/init.d/openbox stop')) // 回滚:停服务
-    assert.ok(c.includes('uci -q delete firewall.openbox_panel')) // 回滚:撤防火墙规则
-    assert.ok(c.includes('/etc/init.d/openbox disable')) // P3 遗留项:回滚后关闭开机自启
+    assert.ok(c.includes('sh /opt/open-box/scripts/service-core.sh stop')) // 回滚:停服务
+    assert.ok(!c.some((x) => x.includes('uci')), 'Android 回滚不依赖 uci(防火墙由 iptables.sh 管理)')
+    assert.ok(c.includes('sh /opt/open-box/scripts/service-core.sh disable')) // 回滚后关闭开机自启
 
     assert.equal(store.getDeployState().stage, 'start')
   } finally {
@@ -259,7 +262,7 @@ test('POST /api/openbox/deploy 重启失败 → 500,回滚命令出现,disable �
 test('POST /api/openbox/deploy 启动后未 running(verify 阶段)→ 500,同样 disable', async () => {
   const ctx = createMockContext({
     files: { [paths.singbox]: '#!/bin/sh\n', [TUN_DEVICE]: '' },
-    execResults: { '/etc/init.d/openbox status': { code: 1, stdout: 'inactive' } },
+    execResults: { 'sh /opt/open-box/scripts/service-core.sh status': { code: 1, stdout: 'inactive' } },
   })
   const { baseUrl, close } = await startApp(ctx)
   try {
@@ -267,7 +270,7 @@ test('POST /api/openbox/deploy 启动后未 running(verify 阶段)→ 500,同样
     assert.equal(res.status, 500)
     const body = await res.json()
     assert.equal(body.stage, 'verify')
-    assert.ok(cmds(ctx).includes('/etc/init.d/openbox disable'))
+    assert.ok(cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh disable'))
   } finally {
     await close()
   }
@@ -326,10 +329,11 @@ test('POST /api/openbox/rollback → 恢复直连并 disable 内核开机自启'
     const body = await res.json()
     assert.equal(body.ok, true)
     assert.ok(body.actions.includes('stop-core'))
-    assert.ok(body.actions.includes('restore-dns'))
-    assert.ok(body.actions.includes('remove-firewall'))
+    // Android 无 uci → restore-dns / remove-firewall 被 /sbin/uci 守卫跳过
+    assert.ok(!body.actions.includes('restore-dns'))
+    assert.ok(!body.actions.includes('remove-firewall'))
 
-    assert.ok(cmds(ctx).includes('/etc/init.d/openbox disable'))
+    assert.ok(cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh disable'))
   } finally {
     await close()
   }
@@ -344,7 +348,7 @@ test('POST /api/openbox/rollback 命令全失败:不抛、200,但 ok:false 且�
     const body = await res.json()
     assert.equal(body.ok, false)
     assert.deepEqual(body.actions, [])
-    assert.deepEqual(body.failures.map((f) => f.step), ['stop-core', 'restore-dns', 'remove-firewall', 'disable-autostart'])
+    assert.deepEqual(body.failures.map((f) => f.step), ['stop-core', 'disable-autostart'])
   } finally {
     await close()
   }
@@ -358,7 +362,7 @@ test('POST /api/openbox/deploy 起来之后又死了(死循环)→ verify 失败
     { code: 1, stdout: 'not running' }, // 等几秒再看:已经崩了
   ]
   const ctx = okCtx({
-    '/etc/init.d/openbox status': () => statuses.shift() || { code: 1, stdout: 'not running' },
+    'sh /opt/open-box/scripts/service-core.sh status': () => statuses.shift() || { code: 1, stdout: 'not running' },
     'logread -e sing-box': {
       code: 0,
       stdout: [
@@ -378,7 +382,7 @@ test('POST /api/openbox/deploy 起来之后又死了(死循环)→ verify 失败
     assert.match(body.message, /detour to an empty direct outbound/)
     assert.ok(!body.message.includes('\u001b'), '终端色码要去掉')
     assert.equal(store.getDeployState().stage, 'verify')
-    assert.ok(cmds(ctx).includes('/etc/init.d/openbox disable'))
+    assert.ok(cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh disable'))
   } finally {
     await close()
   }

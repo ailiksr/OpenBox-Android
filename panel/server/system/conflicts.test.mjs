@@ -17,9 +17,10 @@ test('未安装 → 无冲突', async () => {
 })
 
 test('装了但没运行 → 不算冲突', async () => {
+  // serviceStatus 走 service.mjs 的 `sh <脚本> status`,mock 键要带 sh 前缀
   const ctx = createMockContext({
     files: { '/etc/init.d/openclash': '#!/bin/sh' },
-    execResults: { '/etc/init.d/openclash status': { code: 1, stdout: 'inactive' } },
+    execResults: { 'sh /etc/init.d/openclash status': { code: 1, stdout: 'inactive' } },
   })
   const r = await detectConflicts(ctx)
   assert.equal(r.hasRunning, false)
@@ -29,8 +30,8 @@ test('运行中 → 报冲突并带 label', async () => {
   const ctx = createMockContext({
     files: { '/etc/init.d/openclash': '#!/bin/sh', '/etc/init.d/nikki': '#!/bin/sh' },
     execResults: {
-      '/etc/init.d/openclash status': { code: 0, stdout: 'running' },
-      '/etc/init.d/nikki status': { code: 1, stdout: '' },
+      'sh /etc/init.d/openclash status': { code: 0, stdout: 'running' },
+      'sh /etc/init.d/nikki status': { code: 1, stdout: '' },
     },
   })
   const r = await detectConflicts(ctx)

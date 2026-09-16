@@ -3,6 +3,7 @@ import test from 'node:test'
 import express from 'express'
 import { applyBackup, buildBackup, BACKUP_FORMAT, registerBackupRoutes } from './backup.mjs'
 import { createStore } from '../store/openbox-store.mjs'
+import path from 'node:path'
 
 const memStore = () => {
   const m = new Map()
@@ -83,7 +84,10 @@ test('applyBackup:导进一个空库,档案 / 组 / 订阅 / 节点都在;rulese
   assert.equal(dst.getProfile().dns.mode, 'hijack')
   assert.equal(dst.getProfile().traffic.keepMonths, 12)
   assert.equal(dst.getProfile().routing.policies[0].name, 'AI')
-  assert.equal(dst.getProfile().rulesetDir, '/opt/open-box/data/rulesets', '本机路径不跟着文件走')
+  // rulesetDir 是本机路径,导入时不得跟随备份文件里的值,而是用本机默认根(Android 模块目录)。
+  // 注意:store 用 path.join 拼该默认值,所以在 Windows 上跑测试会得到反斜杠形式,
+  // 在 Android(POSIX)上则是 /data/adb/...。这里与实现保持一致地比对,避免平台差异误报。
+  assert.equal(dst.getProfile().rulesetDir, path.join(process.env.OPENBOX_ROOT || '/data/adb/modules/openbox_android', 'data', 'rulesets'), '本机路径不跟着文件走')
   assert.ok(dst.getGroups().some((g) => g.name === '香港-自动'))
   assert.deepEqual(dst.getSubscriptions().map((s) => s.id), ['s1', 's2'])
   assert.deepEqual(dst.getNodes().map((n) => n.tag), ['HK-01', 'US-01'], '没 tag 的、挂在不存在订阅上的都丢掉')

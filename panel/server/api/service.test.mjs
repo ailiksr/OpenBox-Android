@@ -25,8 +25,8 @@ const cmds = (ctx) => ctx.calls.map((c) => [c.cmd, ...c.args].join(' '))
 const okCtx = (over = {}) => createMockContext({
   files: { [paths.singbox]: '#!/bin/sh\n', [TUN_DEVICE]: '' },
   execResults: {
-    '/etc/init.d/openbox status': { code: 0, stdout: 'running' },
-    '/etc/init.d/openbox-panel status': { code: 1, stdout: 'inactive' },
+    'sh /opt/open-box/scripts/service-core.sh status': { code: 0, stdout: 'running' },
+    'sh /opt/open-box/scripts/service-panel.sh status': { code: 1, stdout: 'inactive' },
     ...over,
   },
 })
@@ -80,7 +80,7 @@ test('POST /api/openbox/service/core/start → {ok,code,stderr}', async () => {
     assert.equal(body.ok, true)
     assert.ok(typeof body.code === 'number')
     assert.ok(typeof body.stderr === 'string')
-    assert.ok(cmds(ctx).includes('/etc/init.d/openbox restart'))
+    assert.ok(cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh restart'))
   } finally {
     await close()
   }
@@ -106,9 +106,10 @@ test('启动内核 = 用当前设置重新生成配置并落盘', async () => {
 
 test('应用失败时启动不谎报成功,原因原样带出去', async () => {
   // 别的代理插件在跑 → 停在 conflict 阶段,内核根本不会被动到
+  // (serviceStatus 走 `sh <脚本> status`,mock 键要带 sh 前缀)
   const ctx = createMockContext({
     files: { '/etc/init.d/openclash': '#!' },
-    execResults: { '/etc/init.d/openclash status': { code: 0, stdout: 'running' } },
+    execResults: { 'sh /etc/init.d/openclash status': { code: 0, stdout: 'running' } },
   })
   const { baseUrl, close } = await startApp(ctx)
   try {
@@ -117,43 +118,43 @@ test('应用失败时启动不谎报成功,原因原样带出去', async () => {
     assert.equal(body.ok, false)
     assert.match(body.stderr, /OpenClash/)
     assert.equal(ctx.writes.length, 0)
-    assert.ok(!cmds(ctx).includes('/etc/init.d/openbox restart'))
+    assert.ok(!cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh restart'))
   } finally {
     await close()
   }
 })
 
 test('POST /api/openbox/service/core/stop → {ok,code,stderr}', async () => {
-  const ctx = okCtx({ '/etc/init.d/openbox status': { code: 1, stdout: 'inactive' } })
+  const ctx = okCtx({ 'sh /opt/open-box/scripts/service-core.sh status': { code: 1, stdout: 'inactive' } })
   const { baseUrl, close } = await startApp(ctx)
   try {
     const res = await fetch(`${baseUrl}/api/openbox/service/core/stop`, { method: 'POST' })
     assert.equal(res.status, 200)
     const body = await res.json()
     assert.equal(body.ok, true)
-    assert.ok(cmds(ctx).includes('/etc/init.d/openbox stop'))
+    assert.ok(cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh stop'))
     // 停止必须同时关掉开机自启,否则坏配置把网搞断时「停止」扛不过一次重启。
-    assert.ok(cmds(ctx).includes('/etc/init.d/openbox disable'))
+    assert.ok(cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh disable'))
   } finally {
     await close()
   }
 })
 
 test('停止失败时不应关闭自启(内核还在跑,关自启只会让状态更乱)', async () => {
-  const ctx = okCtx({ '/etc/init.d/openbox stop': { code: 1, stdout: '', stderr: 'boom' } })
+  const ctx = okCtx({ 'sh /opt/open-box/scripts/service-core.sh stop': { code: 1, stdout: '', stderr: 'boom' } })
   const { baseUrl, close } = await startApp(ctx)
   try {
     const res = await fetch(`${baseUrl}/api/openbox/service/core/stop`, { method: 'POST' })
     const body = await res.json()
     assert.equal(body.ok, false)
-    assert.ok(!cmds(ctx).includes('/etc/init.d/openbox disable'))
+    assert.ok(!cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh disable'))
   } finally {
     await close()
   }
 })
 
 test('停止成功但关自启失败时,如实把原因带回来', async () => {
-  const ctx = okCtx({ '/etc/init.d/openbox disable': { code: 1, stdout: '', stderr: 'no rc.d' }, '/etc/init.d/openbox status': { code: 1, stdout: 'inactive' } })
+  const ctx = okCtx({ 'sh /opt/open-box/scripts/service-core.sh disable': { code: 1, stdout: '', stderr: 'no rc.d' }, 'sh /opt/open-box/scripts/service-core.sh status': { code: 1, stdout: 'inactive' } })
   const { baseUrl, close } = await startApp(ctx)
   try {
     const res = await fetch(`${baseUrl}/api/openbox/service/core/stop`, { method: 'POST' })
@@ -170,7 +171,7 @@ test('重启不得关闭自启(init 的 restart 内部就是 stop+start,不能�
   const { baseUrl, close } = await startApp(ctx)
   try {
     await fetch(`${baseUrl}/api/openbox/service/core/restart`, { method: 'POST' })
-    assert.ok(!cmds(ctx).includes('/etc/init.d/openbox disable'))
+    assert.ok(!cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh disable'))
   } finally {
     await close()
   }
@@ -184,7 +185,7 @@ test('POST /api/openbox/service/core/restart → {ok,code,stderr}', async () => 
     assert.equal(res.status, 200)
     const body = await res.json()
     assert.equal(body.ok, true)
-    assert.ok(cmds(ctx).includes('/etc/init.d/openbox restart'))
+    assert.ok(cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh restart'))
   } finally {
     await close()
   }
@@ -198,7 +199,7 @@ test('POST /api/openbox/service/core/enable → {ok,code,stderr}', async () => {
     assert.equal(res.status, 200)
     const body = await res.json()
     assert.equal(body.ok, true)
-    assert.ok(cmds(ctx).includes('/etc/init.d/openbox enable'))
+    assert.ok(cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh enable'))
   } finally {
     await close()
   }
@@ -212,7 +213,7 @@ test('POST /api/openbox/service/core/disable → {ok,code,stderr}', async () => 
     assert.equal(res.status, 200)
     const body = await res.json()
     assert.equal(body.ok, true)
-    assert.ok(cmds(ctx).includes('/etc/init.d/openbox disable'))
+    assert.ok(cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh disable'))
   } finally {
     await close()
   }
@@ -270,7 +271,7 @@ test('GET /api/openbox/kernel/version handles missing singbox gracefully', async
 })
 
 test('GET /service/status:init 脚本 enabled 退出码非 0 → core.autostart=false', async () => {
-  const ctx = okCtx({ '/etc/init.d/openbox enabled': { code: 1 } })
+  const ctx = okCtx({ 'sh /opt/open-box/scripts/service-core.sh enabled': { code: 1 } })
   const { baseUrl, close } = await startApp(ctx)
   try {
     const body = await (await fetch(`${baseUrl}/api/openbox/service/status`)).json()
@@ -316,8 +317,8 @@ test('停止后内核迟迟不退出 → ok:false 并说明,不再谎报已停�
     const body = await res.json()
     assert.equal(body.ok, false)
     assert.match(body.stderr, /没有退出/)
-    assert.ok(!cmds(ctx).includes('/etc/init.d/openbox disable'))
-    assert.ok(cmds(ctx).filter((c) => c === '/etc/init.d/openbox status').length >= 2, '应该轮询过 status')
+    assert.ok(!cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh disable'))
+    assert.ok(cmds(ctx).filter((c) => c === 'sh /opt/open-box/scripts/service-core.sh status').length >= 2, '应该轮询过 status')
   } finally {
     await close()
   }
@@ -330,8 +331,8 @@ test('部署途中点停止:部署被标成取消(不 enable),停止随后执行
   const verifyGate = new Promise((r) => { releaseVerify = r })
   let stopped = false
   const ctx = okCtx({
-    '/etc/init.d/openbox status': () => (stopped ? { code: 1, stdout: 'inactive' } : { code: 0, stdout: 'running' }),
-    '/etc/init.d/openbox stop': () => { stopped = true; return { code: 0 } },
+    'sh /opt/open-box/scripts/service-core.sh status': () => (stopped ? { code: 1, stdout: 'inactive' } : { code: 0, stdout: 'running' }),
+    'sh /opt/open-box/scripts/service-core.sh stop': () => { stopped = true; return { code: 0 } },
   })
   // deployConfig 验证阶段会 sleep 几秒再看第二眼:借这个 sleep 把部署挂住
   ctx.sleep = () => verifyGate
@@ -339,12 +340,12 @@ test('部署途中点停止:部署被标成取消(不 enable),停止随后执行
   try {
     const starting = fetch(`${baseUrl}/api/openbox/service/core/start`, { method: 'POST' })
     // 等部署走到重启内核之后(挂在验证的 sleep 里)
-    for (let i = 0; i < 200 && !cmds(ctx).includes('/etc/init.d/openbox restart'); i++) await new Promise((r) => setTimeout(r, 5))
-    assert.ok(cmds(ctx).includes('/etc/init.d/openbox restart'))
+    for (let i = 0; i < 200 && !cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh restart'); i++) await new Promise((r) => setTimeout(r, 5))
+    assert.ok(cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh restart'))
     const stopping = fetch(`${baseUrl}/api/openbox/service/core/stop`, { method: 'POST' })
     await new Promise((r) => setTimeout(r, 20))
     // 停止在排队,还没执行
-    assert.ok(!cmds(ctx).includes('/etc/init.d/openbox stop'))
+    assert.ok(!cmds(ctx).includes('sh /opt/open-box/scripts/service-core.sh stop'))
     releaseVerify()
     const startBody = await (await starting).json()
     const stopBody = await (await stopping).json()
@@ -352,9 +353,9 @@ test('部署途中点停止:部署被标成取消(不 enable),停止随后执行
     assert.match(startBody.stderr, /取消/)
     assert.equal(stopBody.ok, true)
     const c = cmds(ctx)
-    assert.ok(c.indexOf('/etc/init.d/openbox restart') < c.indexOf('/etc/init.d/openbox stop'), '停止必须排在部署之后执行')
-    assert.ok(!c.includes('/etc/init.d/openbox enable'), '被取消的部署不能把自启打开')
-    assert.ok(c.includes('/etc/init.d/openbox disable'))
+    assert.ok(c.indexOf('sh /opt/open-box/scripts/service-core.sh restart') < c.indexOf('sh /opt/open-box/scripts/service-core.sh stop'), '停止必须排在部署之后执行')
+    assert.ok(!c.includes('sh /opt/open-box/scripts/service-core.sh enable'), '被取消的部署不能把自启打开')
+    assert.ok(c.includes('sh /opt/open-box/scripts/service-core.sh disable'))
   } finally {
     await close()
   }
