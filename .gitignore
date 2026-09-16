@@ -1,5 +1,7 @@
 # Runtime data & state
-data/
+data/*
+!data/rulesets/
+!data/rulesets/**
 etc/config.json
 etc/config.candidate.json
 etc/config.meta.json

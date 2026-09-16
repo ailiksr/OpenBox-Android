@@ -29,7 +29,7 @@ jobs:
           mkdir -p bin node/bin node/lib
           
           # 1. Download official statically compiled sing-box
-          SINGBOX_VER="1.13.14"
+          SINGBOX_VER="1.14.0"
           echo "Downloading sing-box v${SINGBOX_VER}..."
           curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-arm64-musl.tar.gz" -o singbox.tar.gz
           tar -xzf singbox.tar.gz
@@ -55,7 +55,7 @@ jobs:
 
       - name: Package Magisk/KernelSU Zip
         run: |
-          VERSION="${GITHUB_REF_NAME:-v2.0.7}"
+          VERSION="${GITHUB_REF_NAME:-v2.0.8}"
           ZIP_NAME="OpenBox-Android-SukiSU-${VERSION}.zip"
           zip -r "${ZIP_NAME}" * -x ".git*" ".github*" "*.tar.gz" "*.apk"
 
