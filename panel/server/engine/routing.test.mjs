@@ -7,22 +7,30 @@ const build = (routing, options) => buildRoute(routing, RULESET_DIR, options)
 
 const policy = (over = {}) => ({ id: 'p1', name: '谷歌', rulesets: ['geosite-google'], ...over })
 
-// 前三条规则(sniff / DNS 劫持 / 内网直连)和站点集无关,单独断言一次,
+// 固定前缀(sniff / DNS 协议劫持 / 53 端口劫持 / 内网直连)和站点集无关,单独断言一次,
 // 后面的用例只看它们各自关心的那几条,免得任何一条规则挪位置就全线飘红。
-test('固定前缀:sniff → DNS 劫持 → 内网直连', () => {
+// Android 端按红线 6 强制双重劫持:{protocol:'dns'} 接住 dns-in 收到的查询,{port:[53]}
+// 接住 App 直发 53 端口的查询——两条都在前缀里,所以 PREFIX 是 4 而不是上游的 3。
+const PREFIX = 4
+test('固定前缀:sniff → DNS 协议劫持 → 53 端口劫持 → 内网直连', () => {
   const { route } = build({ policies: [] })
-  assert.deepEqual(route.rules.slice(0, 3), [
+  assert.deepEqual(route.rules.slice(0, PREFIX), [
     { action: 'sniff' },
     { protocol: 'dns', action: 'hijack-dns' },
+    { port: [53], action: 'hijack-dns' },
     { ip_is_private: true, outbound: 'direct' },
   ])
-  assert.equal(route.auto_detect_interface, true)
+  // 红线 2:严禁写入 auto_detect_interface——出站自行绑定 lo / 接口,内核不得自动探测,
+  // 否则直连出站会被绑到 WAN 口,回环链路(127.0.0.1:7891)拨不通。
+  assert.equal(route.auto_detect_interface, undefined)
+  // 红线 2:防环路高位标记必须锁定 131072(0x20000),与 scripts/iptables.sh 的 SELF_MARK 一致。
+  assert.equal(route.default_mark, 131072)
   assert.equal(route.default_domain_resolver, 'dns-direct')
 })
 
 test('没有任何站点集时,全部流量落到兜底的「其他」', () => {
   const { route } = build({ policies: [] })
-  assert.deepEqual(route.rules.slice(3), [])
+  assert.deepEqual(route.rules.slice(PREFIX), [])
   assert.equal(route.final, '其他')
 })
 
@@ -30,7 +38,7 @@ test('站点集按顺序生成规则,出站是它自己的同名 selector', () =
   const { route } = build({
     policies: [policy(), policy({ id: 'p2', name: '微软', rulesets: ['geosite-microsoft'] })],
   })
-  assert.deepEqual(route.rules.slice(3), [
+  assert.deepEqual(route.rules.slice(PREFIX), [
     { rule_set: ['geosite-google'], outbound: '谷歌' },
     { rule_set: ['geosite-microsoft'], outbound: '微软' },
   ])
@@ -40,13 +48,13 @@ test('规则集链接:路由规则按形状表引用域名 / IP 两份 .srs,两�
   const routing = { policies: [policy({ rulesets: [], ruleUrls: ['https://x.test/Check.list'] })] }
   const tag = 'list-' + (() => { let h = 0x811c9dc5; for (const ch of 'https://x.test/Check.list') { h ^= ch.charCodeAt(0); h = Math.imul(h, 0x01000193) >>> 0 } return h.toString(16).padStart(8, '0') })()
   const both = build(routing, { ruleLists: { [tag]: { domain: true, ip: true } } })
-  assert.deepEqual(both.route.rules[3], { rule_set: [tag, `${tag}-ip`], outbound: '谷歌' })
+  assert.deepEqual(both.route.rules[PREFIX], { rule_set: [tag, `${tag}-ip`], outbound: '谷歌' })
   assert.deepEqual(both.route.rule_set.map((s) => s.path), [`${RULESET_DIR}/${tag}.srs`, `${RULESET_DIR}/${tag}-ip.srs`])
   const ipOnly = build(routing, { ruleLists: { [tag]: { domain: false, ip: true } } })
-  assert.deepEqual(ipOnly.route.rules[3], { rule_set: [`${tag}-ip`], outbound: '谷歌' })
+  assert.deepEqual(ipOnly.route.rules[PREFIX], { rule_set: [`${tag}-ip`], outbound: '谷歌' })
   // 没有形状表(预览、还没拉过):按老样子引用一份
   const unknown = build(routing)
-  assert.deepEqual(unknown.route.rules[3], { rule_set: [tag], outbound: '谷歌' })
+  assert.deepEqual(unknown.route.rules[PREFIX], { rule_set: [tag], outbound: '谷歌' })
 })
 
 test('一个站点集的五类条件:规则集一条、手写域名 / IP 一条,紧邻、同一出口(1.14 起规则集不再稳定地和同条里的域名 / IP「或」)', () => {
@@ -61,8 +69,8 @@ test('一个站点集的五类条件:规则集一条、手写域名 / IP 一条,
       }),
     ],
   })
-  assert.deepEqual(route.rules[3], { rule_set: ['geosite-google', 'geoip-google'], outbound: '谷歌' })
-  assert.deepEqual(route.rules[4], {
+  assert.deepEqual(route.rules[PREFIX], { rule_set: ['geosite-google', 'geoip-google'], outbound: '谷歌' })
+  assert.deepEqual(route.rules[PREFIX + 1], {
     domain: ['example.com'],
     domain_suffix: ['google.com'],
     domain_keyword: ['gstatic'],
@@ -75,45 +83,47 @@ test('一个站点集的五类条件:规则集一条、手写域名 / IP 一条,
 
 test('没有任何规则的站点集被丢掉——空条件规则在内核里等于"全部命中",会盖住后面所有规则', () => {
   const { route } = build({ policies: [{ id: 'x', name: '空的' }] })
-  assert.deepEqual(route.rules.slice(3), [])
+  assert.deepEqual(route.rules.slice(PREFIX), [])
 })
 
 test('名字叫「其他」的站点集被丢掉:那是兜底的保留名,重名会生成两个同名出站', () => {
   const { route } = build({ policies: [policy({ name: '其他' })] })
-  assert.deepEqual(route.rules.slice(3), [])
+  assert.deepEqual(route.rules.slice(PREFIX), [])
   assert.equal(route.final, '其他')
 })
 
 test('广告拦截排在所有站点集之前', () => {
   const { route } = build({ adBlock: true, policies: [policy()] })
-  assert.deepEqual(route.rules[3], { rule_set: 'geosite-category-ads-all', action: 'reject' })
-  assert.equal(route.rules[4].outbound, '谷歌')
+  assert.deepEqual(route.rules[PREFIX], { rule_set: 'geosite-category-ads-all', action: 'reject' })
+  assert.equal(route.rules[PREFIX + 1].outbound, '谷歌')
 })
 
-test('dnsmasq 模式:被 auto_redirect 改写到 tun 网段:53 的局域网 DNS 交回本机 dnsmasq,排在防回环 reject 之前', () => {
-  const { route } = build({ policies: [] }, { dnsMode: 'dnsmasq', tunCidrs: ['172.19.0.0/30'], dnsmasqTag: 'dnsmasq' })
-  assert.deepEqual(route.rules[1], { inbound: ['dns-in'], action: 'hijack-dns' })
-  assert.deepEqual(route.rules[2], {
-    ip_cidr: ['172.19.0.0/30'], port: [53], action: 'route', outbound: 'dnsmasq', override_address: '127.0.0.1',
-  })
-  assert.deepEqual(route.rules[3], { ip_cidr: ['172.19.0.0/30'], action: 'reject' })
-  assert.ok(route.rules[4].ip_is_private)
-  // hijack 模式靠 protocol:dns 接住,不需要这条
-  const h = build({ policies: [] }, { dnsMode: 'hijack', tunCidrs: ['172.19.0.0/30'], dnsmasqTag: 'dnsmasq' })
-  assert.ok(!h.route.rules.some((r) => r.override_address))
-})
-
-test('dnsMode=off 时只劫持 dns-in 自己收到的查询(AdGuard 等主动指过来的),不改写别的 DNS,也没有回交规则', () => {
+// 红线 6:Android 端 DNS 劫持是无条件的——无论 dnsMode 传什么(off / dnsmasq / hijack),
+// 都必须同时写入 {protocol:'dns'} 与 {port:[53]} 两条劫持规则。上游 OpenWrt 那套
+// 「dnsmasq 只劫持 dns-in、off 完全不劫持」的语义在移动端已被废弃,这里改为断言不可退化。
+test('红线 6:dnsMode 为 off 时仍强制双劫持(协议 + 53 端口),不允许退化成只劫持 dns-in', () => {
   const { route } = build({ policies: [] }, { dnsMode: 'off', tunCidrs: ['172.19.0.0/30'], dnsmasqTag: 'dnsmasq' })
-  assert.deepEqual(route.rules.filter((r) => r.action === 'hijack-dns'), [{ inbound: ['dns-in'], action: 'hijack-dns' }])
-  assert.ok(!route.rules.some((r) => r.protocol === 'dns'))
-  assert.ok(!route.rules.some((r) => r.override_address))
+  assert.deepEqual(route.rules.filter((r) => r.action === 'hijack-dns'), [
+    { protocol: 'dns', action: 'hijack-dns' },
+    { port: [53], action: 'hijack-dns' },
+  ])
 })
 
-test('dnsMode=dnsmasq 时只劫持 dns-in,避免 tun→dns-in 自环', () => {
+test('红线 6:dnsMode 为 dnsmasq 时仍强制双劫持,避免 tun→dns-in 自环的同时不漏接 App 直发 53', () => {
   const { route } = build({ policies: [] }, { dnsMode: 'dnsmasq' })
-  assert.deepEqual(route.rules[1], { inbound: ['dns-in'], action: 'hijack-dns' })
-  assert.ok(!route.rules.some((r) => r.protocol === 'dns'))
+  assert.deepEqual(route.rules.filter((r) => r.action === 'hijack-dns'), [
+    { protocol: 'dns', action: 'hijack-dns' },
+    { port: [53], action: 'hijack-dns' },
+  ])
+})
+
+test('tun 防回环:目标是 tun 网段的连接被 reject,且排在 ip_is_private 之前', () => {
+  const { route } = build({ policies: [] }, { dnsMode: 'dnsmasq', tunCidrs: ['172.19.0.0/30'], dnsmasqTag: 'dnsmasq' })
+  const rejectAt = route.rules.findIndex((r) => r.action === 'reject' && Array.isArray(r.ip_cidr))
+  const privateAt = route.rules.findIndex((r) => r.ip_is_private)
+  assert.ok(rejectAt !== -1, '缺少 tun 网段防回环 reject')
+  assert.deepEqual(route.rules[rejectAt], { ip_cidr: ['172.19.0.0/30'], action: 'reject' })
+  assert.ok(privateAt !== -1 && rejectAt < privateAt, '防回环 reject 必须排在 ip_is_private 之前')
 })
 
 // -------- 地区层退役:老档案迁移(行为不变) --------
@@ -132,7 +142,7 @@ test('地区档案:选中的地区按动作拆成站点集,接在用户的站点
     }],
     regionId: 'cn',
   })
-  assert.deepEqual(route.rules.slice(3), [
+  assert.deepEqual(route.rules.slice(PREFIX), [
     { rule_set: ['geosite-google'], outbound: '谷歌' },
     { rule_set: ['geosite-cn', 'geoip-cn'], outbound: '中国大陆·直连' },
   ])
@@ -154,7 +164,7 @@ test('地区档案:一条地区里既有直连又有代理的规则时,拆成两
     }],
     regionId: 'jp',
   })
-  assert.deepEqual(route.rules.slice(3), [
+  assert.deepEqual(route.rules.slice(PREFIX), [
     { rule_set: ['geosite-jp'], outbound: '日本·直连' },
     { rule_set: ['geosite-cn'], outbound: '日本·代理' },
   ])
@@ -167,7 +177,7 @@ test('已经迁过的档案(有 fallbackDefault)不再翻译地区,免得每次�
     regions: [{ id: 'cn', name: '中国大陆', catchAll: 'proxy', rules: [{ type: 'geosite', value: 'cn', action: 'direct' }] }],
     regionId: 'cn',
   })
-  assert.deepEqual(route.rules.slice(3), [{ rule_set: ['geosite-google'], outbound: '谷歌' }])
+  assert.deepEqual(route.rules.slice(PREFIX), [{ rule_set: ['geosite-google'], outbound: '谷歌' }])
 })
 
 test('更老的档案:categories 变成站点集', () => {
@@ -177,7 +187,7 @@ test('更老的档案:categories 变成站点集', () => {
     directRulesets: ['geosite-cn', 'geoip-cn'],
     fallback: 'PROXY',
   })
-  assert.deepEqual(route.rules[3], { rule_set: ['geosite-netflix'], outbound: 'geosite-netflix' })
+  assert.deepEqual(route.rules[PREFIX], { rule_set: ['geosite-netflix'], outbound: 'geosite-netflix' })
 })
 
 test('更老的档案:始终直连里非中国的规则集变成一个默认直连的站点集', () => {
@@ -324,7 +334,9 @@ test('IPv6 分层 · 代理 v6 降为 IPv4:出口是代理线路的规则前面�
     ],
     custom: { rules: [{ type: 'domainSuffix', value: 'x.test', outbound: '香港-自动' }, { type: 'domainSuffix', value: 'y.test', outbound: 'direct' }] },
   }, { rejectV6For, clientRoutes: [{ sources: ['192.168.1.9/32'], outbound: '香港-自动' }] })
-  const rules = route.rules.slice(2)   // 跳过 sniff / hijack-dns(前置自定义分流排在 ip_is_private 前面)
+  // 跳过 3 条固定前缀(sniff / 协议劫持 / 53 端口劫持)。注意不能用 PREFIX(4):
+  // 前置自定义分流插在 ip_is_private 之前,所以它排在第 4 位,而 ip_is_private 被推到后面。
+  const rules = route.rules.slice(3)
   // 前置自定义分流:代理行前有 v6 拒绝,直连行没有
   assert.deepEqual(rules[0], { domain_suffix: ['x.test'], ip_version: 6, action: 'reject' })
   assert.deepEqual(rules[1], { domain_suffix: ['x.test'], outbound: '香港-自动' })

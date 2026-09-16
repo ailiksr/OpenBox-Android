@@ -16,6 +16,12 @@ etc/config.meta.json
 bin/sing-box
 node/bin/node.bin
 
+# Dependencies: installed locally and injected by CI before packaging.
+# Never commit node_modules (git cannot persist pnpm's symlink layout, which
+# left clones with an unusable .pnpm store and no top-level package links).
+node_modules/
+panel/server/node_modules/
+
 # OS & Editor
 .DS_Store
 Thumbs.db

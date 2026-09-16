@@ -24,6 +24,22 @@ jobs:
       - name: Install pnpm
         run: corepack enable && corepack prepare pnpm@latest --activate
 
+      - name: Install Panel Server Dependencies
+        run: |
+          # node_modules 不再入库，必须在打包前装入运行依赖，
+          # 否则 Release zip 里的面板会因 import express/ws/yaml 失败而无法启动。
+          cd panel/server
+          pnpm install --prod
+          # 硬校验：缺任何一个运行依赖都直接让流水线失败，绝不产出半残的包
+          for dep in express ws yaml; do
+            if [ ! -d "node_modules/$dep" ]; then
+              echo "::error::运行依赖 $dep 缺失，打包会产出无法启动的面板"
+              exit 1
+            fi
+          done
+          echo "运行依赖校验通过："
+          du -sh node_modules
+
       - name: Download Precompiled Binaries
         run: |
           mkdir -p bin node/bin node/lib
