@@ -15,6 +15,9 @@ etc/config.meta.json
 # Binaries downloaded via build/release scripts
 bin/sing-box
 node/bin/node.bin
+# 本机跑 check:config 时临时放置的 sing-box(80MB+)。engine/check-config.test.mjs 找不到它会跳过;
+# 只是本机校验用,绝不入库
+panel/.tools/
 
 # Dependencies: installed locally and injected by CI before packaging.
 # Never commit node_modules (git cannot persist pnpm's symlink layout, which

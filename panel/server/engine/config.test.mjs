@@ -328,7 +328,9 @@ test('IPv6 分层(第三轮 阶段 5):ipv6 开 + ipv6Proxy=ipv4 时按此刻的�
   assert.ok(!split.route.rules.some((r) => r.ip_version === 6 && r.rule_set && r.rule_set.includes('geoip-cn')), '直连站点集前不插')
   assert.ok(!split.route.rules.some((r) => r.ip_version === 6 && !r.rule_set), '兜底直连:没有裸 v6 拒绝')
   const gi = split.dns.rules.findIndex((r) => r.server === 'dns-policy-0')
-  assert.deepEqual(split.dns.rules[gi - 1], { rule_set: ['geosite-google'], query_type: ['AAAA'], action: 'predefined', rcode: 'NOERROR' })
+  // 走代理的站点集前面两条回空:先 AAAA(v6 降级),再 HTTPS / SVCB(走节点隧道不必要的服务类型记录)
+  assert.deepEqual(split.dns.rules[gi - 2], { rule_set: ['geosite-google'], query_type: ['AAAA'], action: 'predefined', rcode: 'NOERROR' })
+  assert.deepEqual(split.dns.rules[gi - 1], { rule_set: ['geosite-google'], query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' })
   assert.deepEqual(split.dns.rules[gi], { rule_set: ['geosite-google'], server: 'dns-policy-0' })
   assert.equal(split.dns.strategy, 'prefer_ipv4')
   // 代理页把 Google 切到直连:不再插;把「国内」切到代理:插
@@ -389,7 +391,9 @@ test('IPv6「不进内核,直连放行」(ipv6Proxy=bypass):不插 v6 拒绝,DNS
   const c = buildConfig({ nodes, regionGroups, userGroups: firstLayerGroups, localSubnets: subnets, profile: p })
   assert.ok(!c.route.rules.some((r) => r.ip_version === 6), '不插 v6 拒绝')
   assert.equal(c.dns.strategy, 'prefer_ipv4', 'DNS 照常给 AAAA')
-  assert.ok(!c.dns.rules.some((r) => r.action === 'predefined'))
+  // bypass 不写 AAAA 回空(v6 照常解析);HTTPS / SVCB 回空和 v6 分层无关,照常有
+  assert.ok(!c.dns.rules.some((r) => (r.query_type || []).includes('AAAA')))
+  assert.ok(c.dns.rules.some((r) => Array.isArray(r.query_type) && r.query_type.includes('HTTPS') && r.action === 'predefined'))
   // 防回环那条只管 v4 的 tun 网段
   assert.deepEqual(c.route.rules.find((r) => r.action === 'reject' && r.ip_cidr), { ip_cidr: ['172.19.0.0/30'], action: 'reject' })
   const fake = buildConfig({ nodes, regionGroups, userGroups: firstLayerGroups, localSubnets: subnets, profile: firstLayerProfile({ ipv6: true, ipv6Proxy: 'bypass', dns: { split: true, mode: 'dnsmasq', direct: '223.5.5.5', proxy: '1.1.1.1', fakeIpForProxy: true }, routing: p.routing }) })

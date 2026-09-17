@@ -11,6 +11,12 @@ const base = {
 }
 const withRouting = (routing, over = {}) => ({ ...base, ...over, routing: { ...base.routing, ...routing } })
 
+// 「HTTPS / SVCB 回空」那条(见 engine/dns.mjs 的 emptyServiceTypes):走代理解析的匹配前面都会多一条。
+// 它只管这两类查询类型,和「这个域名的 A 由谁解析」无关,所以下面判定 A 解析归属的用例统一先把它滤掉。
+// 它自己的行为由本文件末尾的专项用例守护。
+const isServiceEmpty = (r) => Array.isArray(r.query_type) && r.query_type.length === 2 && r.query_type.includes('HTTPS') && r.query_type.includes('SVCB') && r.action === 'predefined'
+const withoutServiceEmpty = (rules) => rules.filter((r) => !isServiceEmpty(r))
+
 test('hijack 模式:直连侧也用 WAN 上游而不是 local(local 会经 dnsmasq 绕回局域网里的 AdGuard 形成回环);本地主机名单独交给 local', () => {
   const dns = buildDns({ ...base, dns: { ...base.dns, mode: 'hijack' } }, { systemDns: ['192.168.1.1', '8.8.8.8'] })
   assert.deepEqual(dns.servers[0], { type: 'udp', tag: 'dns-direct', server: '192.168.1.1' })
@@ -66,9 +72,12 @@ test('走代理的站点集各有一台自己的 DNS,detour 指向同名 selecto
     GROUPS,
   )
   assert.deepEqual(dns.servers[2], { type: 'tcp', tag: 'dns-policy-0', server: '1.1.1.1', detour: '谷歌' })
-  // 规则集和手写域名拆成紧邻的两条、同一台解析器(sing-box 1.14 起规则集不再稳定地和同条里的域名条件「或」)
-  assert.deepEqual(dns.rules[0], { rule_set: ['geosite-google'], server: 'dns-policy-0' })
-  assert.deepEqual(dns.rules[1], { domain_suffix: ['google.com'], server: 'dns-policy-0' })
+  // 规则集和手写域名拆成紧邻的两条、同一台解析器(sing-box 1.14 起规则集不再稳定地和同条里的域名条件「或」);
+  // 每条规则集前面还有一条 HTTPS / SVCB 回空,这里只看 A 的归属
+  const mine = withoutServiceEmpty(dns.rules)
+  assert.deepEqual(mine[0], { rule_set: ['geosite-google'], server: 'dns-policy-0' })
+  assert.deepEqual(mine[1], { domain_suffix: ['google.com'], server: 'dns-policy-0' })
+  assert.deepEqual(dns.rules[0], { rule_set: ['geosite-google'], query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' })
 })
 
 test('走直连的站点集用本地解析(国内站点才拿得到就近地址),不给专属解析器', () => {
@@ -96,8 +105,8 @@ test('内核里当前的选择优先于档案默认:默认直连但代理页切�
   }
   const selections = { 谷歌: '香港-自动', '香港-自动': 'HK-01', 中国: 'direct', 其他: '香港-自动' }
   const dns = buildDns(withRouting(routing), { ...GROUPS, selections })
-  assert.deepEqual(dns.rules[0], { server: 'dns-policy-0', rule_set: ['geosite-google'] })
-  assert.deepEqual(dns.rules[1], { server: 'dns-direct', rule_set: ['geosite-cn'] })
+  assert.deepEqual(withoutServiceEmpty(dns.rules)[0], { server: 'dns-policy-0', rule_set: ['geosite-google'] })
+  assert.deepEqual(withoutServiceEmpty(dns.rules)[1], { server: 'dns-direct', rule_set: ['geosite-cn'] })
   assert.equal(dns.final, 'dns-proxy')
 })
 
@@ -108,7 +117,7 @@ test('geoip 规则集不进 DNS 规则:含 IP 的规则集会让内核对每个�
     }),
     GROUPS,
   )
-  assert.deepEqual(dns.rules[0], { server: 'dns-policy-0', rule_set: ['geosite-netflix'] })
+  assert.deepEqual(withoutServiceEmpty(dns.rules)[0], { server: 'dns-policy-0', rule_set: ['geosite-netflix'] })
 })
 
 test('只有 geoip 规则集的站点集不生成 DNS 规则,也不给专属解析器', () => {
@@ -116,7 +125,8 @@ test('只有 geoip 规则集的站点集不生成 DNS 规则,也不给专属解�
     withRouting({ policies: [{ id: 'p1', name: '电报', default: 'block', rulesets: ['geoip-telegram'] }] }),
     GROUPS,
   )
-  assert.deepEqual(dns.rules, [])
+  // 站点集自己一条都不生成;ruless 里只剩兜底走代理时的那条 HTTPS / SVCB 回空(和站点集无关)
+  assert.deepEqual(dns.rules, [{ query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' }])
   assert.equal(dns.servers.length, 2)
 })
 
@@ -124,15 +134,17 @@ test('规则集链接:DNS 规则只引用域名那份;名单里只有 IP 的不�
   const routing = { policies: [{ id: 'p1', name: 'Speed', default: 'block', ruleUrls: ['https://x.test/Check.list'] }] }
   const tag = 'list-' + (() => { let h = 0x811c9dc5; for (const ch of 'https://x.test/Check.list') { h ^= ch.charCodeAt(0); h = Math.imul(h, 0x01000193) >>> 0 } return h.toString(16).padStart(8, '0') })()
   const both = buildDns(withRouting(routing), { ...GROUPS, ruleLists: { [tag]: { domain: true, ip: true } } })
-  assert.deepEqual(both.rules[0], { server: 'dns-policy-0', rule_set: [tag] })
+  assert.deepEqual(withoutServiceEmpty(both.rules)[0], { server: 'dns-policy-0', rule_set: [tag] })
   const ipOnly = buildDns(withRouting(routing), { ...GROUPS, ruleLists: { [tag]: { domain: false, ip: true } } })
-  assert.deepEqual(ipOnly.rules, [])
+  // 名单只有 IP 那份:站点集不进 DNS 规则,只剩兜底的 HTTPS / SVCB 回空
+  assert.deepEqual(ipOnly.rules, [{ query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' }])
   assert.equal(ipOnly.servers.length, 2)
   const unknown = buildDns(withRouting(routing), GROUPS)
-  assert.deepEqual(unknown.rules[0], { server: 'dns-policy-0', rule_set: [tag] })
+  assert.deepEqual(withoutServiceEmpty(unknown.rules)[0], { server: 'dns-policy-0', rule_set: [tag] })
 })
 
 test('只有 IP 条件的站点集不进 DNS 规则:解析阶段还没有 IP,写进去只会让人以为生效了', () => {
+  // 一个节点组都没有 → 兜底只能落回直连,也就没有那条 HTTPS / SVCB 回空:规则一条都不该有
   const dns = buildDns(withRouting({ policies: [{ id: 'p1', name: '内网', ipCidr: ['10.0.0.0/8'] }] }))
   assert.deepEqual(dns.rules, [])
   assert.equal(dns.servers.length, 2)
@@ -277,9 +289,12 @@ test('终端分流(劫持模式):指定来源的终端,解析跟着它的出口�
     },
   )
   const src = dns.rules.filter((r) => r.source_ip_cidr)
+  // 走节点的终端前后各多一条 HTTPS / SVCB 回空(和来源同一个条件):这两类查询也不该进节点隧道
   assert.deepEqual(src, [
     { source_ip_cidr: ['192.168.1.10/32', '2001:db8::10/128'], server: 'dns-direct' },
+    { source_ip_cidr: ['192.168.1.20/32'], query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' },
     { source_ip_cidr: ['192.168.1.20/32'], server: 'dns-client-0' },
+    { source_ip_cidr: ['192.168.1.30/32'], query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' },
     { source_ip_cidr: ['192.168.1.30/32'], server: 'dns-client-1' },
     { source_ip_cidr: ['192.168.1.40/32'], action: 'reject' },
   ])
@@ -311,17 +326,20 @@ test('FakeIP 原型(dns.fakeIpForProxy):走代理的匹配先给 A / AAAA 一条
   const on = buildDns({ ...withRouting(routing), dns: { ...base.dns, fakeIpForProxy: true } }, GROUPS)
   const fake = on.servers.find((s) => s.type === 'fakeip')
   assert.deepEqual(fake, { type: 'fakeip', tag: 'dns-fakeip', inet4_range: '198.18.0.0/15', inet6_range: 'fc00::/18' })
-  // 自定义代理行:占位规则在真解析器规则前面,且只管 A / AAAA
-  assert.deepEqual(on.rules[0], { domain_suffix: ['x.test'], query_type: ['A', 'AAAA'], server: 'dns-fakeip' })
-  assert.deepEqual(on.rules[1], { domain_suffix: ['x.test'], server: 'dns-custom-0' })
-  // 拒绝行照旧拒绝,不发占位地址
-  assert.deepEqual(on.rules[2], { domain_suffix: ['ad.test'], action: 'reject' })
-  // 站点集:走代理的先占位,直连的照旧真实解析
-  assert.deepEqual(on.rules[3], { rule_set: ['geosite-google'], query_type: ['A', 'AAAA'], server: 'dns-fakeip' })
-  assert.deepEqual(on.rules[4], { server: 'dns-policy-0', rule_set: ['geosite-google'] })
-  assert.deepEqual(on.rules[5], { server: 'dns-direct', rule_set: ['geosite-cn'] })
-  // 兜底走代理:没命中的域名 A / AAAA 也占位;final 仍是代理侧解析器(其它查询类型)
-  assert.deepEqual(on.rules[6], { query_type: ['A', 'AAAA'], server: 'dns-fakeip' })
+  // 自定义代理行:HTTPS / SVCB 先回空,再是占位规则(只管 A / AAAA),最后才是真解析器
+  assert.deepEqual(on.rules[0], { domain_suffix: ['x.test'], query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' })
+  assert.deepEqual(on.rules[1], { domain_suffix: ['x.test'], query_type: ['A', 'AAAA'], server: 'dns-fakeip' })
+  assert.deepEqual(on.rules[2], { domain_suffix: ['x.test'], server: 'dns-custom-0' })
+  // 拒绝行照旧拒绝,不发占位地址,也不插回空
+  assert.deepEqual(on.rules[3], { domain_suffix: ['ad.test'], action: 'reject' })
+  // 站点集:走代理的先回空再占位,直连的照旧真实解析
+  assert.deepEqual(on.rules[4], { rule_set: ['geosite-google'], query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' })
+  assert.deepEqual(on.rules[5], { rule_set: ['geosite-google'], query_type: ['A', 'AAAA'], server: 'dns-fakeip' })
+  assert.deepEqual(on.rules[6], { server: 'dns-policy-0', rule_set: ['geosite-google'] })
+  assert.deepEqual(on.rules[7], { server: 'dns-direct', rule_set: ['geosite-cn'] })
+  // 兜底走代理:没命中的域名先回空 HTTPS / SVCB,再让 A / AAAA 占位;final 仍是代理侧解析器
+  assert.deepEqual(on.rules[8], { query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' })
+  assert.deepEqual(on.rules[9], { query_type: ['A', 'AAAA'], server: 'dns-fakeip' })
   assert.equal(on.final, 'dns-proxy')
   // 没开 IPv6 就不给 v6 占位段
   const v4 = buildDns({ ...withRouting(routing), ipv6: false, dns: { ...base.dns, fakeIpForProxy: true } }, GROUPS)
@@ -357,29 +375,38 @@ test('IPv6 分层 · 代理 v6 降为 IPv4(ipv6 开 + ipv6Proxy=ipv4):走代理�
   const split = buildDns({ ...withRouting(routing), ipv6: true, ipv6Proxy: 'ipv4' }, GROUPS)
   assert.equal(split.strategy, 'prefer_ipv4')                       // 全局(直连侧)仍然双栈
   assert.deepEqual(split.rules[0], { rule_set: ['geosite-google'], query_type: ['AAAA'], action: 'predefined', rcode: 'NOERROR' })
-  assert.deepEqual(split.rules[1], { rule_set: ['geosite-google'], server: 'dns-policy-0' })
-  assert.deepEqual(split.rules[2], { server: 'dns-direct', rule_set: ['geosite-cn'] })
-  assert.deepEqual(split.rules.at(-1), { query_type: ['AAAA'], action: 'predefined', rcode: 'NOERROR' })
+  assert.deepEqual(split.rules[1], { rule_set: ['geosite-google'], query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' })
+  assert.deepEqual(split.rules[2], { rule_set: ['geosite-google'], server: 'dns-policy-0' })
+  assert.deepEqual(split.rules[3], { server: 'dns-direct', rule_set: ['geosite-cn'] })
+  // 兜底走代理:先回空 AAAA(v6 降级),再回空 HTTPS / SVCB(走代理通道的通用处理)
+  assert.deepEqual(split.rules.slice(-2), [
+    { query_type: ['AAAA'], action: 'predefined', rcode: 'NOERROR' },
+    { query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' },
+  ])
   assert.equal(split.final, 'dns-proxy')
   // 遗留的 strategy 动作一条都不写:1.14 里它和 query_type 不能出现在同一份 DNS 配置里(启动 FATAL)
   assert.ok(!split.rules.some((r) => r.strategy))
-  // 兜底直连:没有那条 AAAA 收尾
+  // 兜底直连:没有那两条收尾(站点集自己的回空仍带着 rule_set 条件,不是收尾)
   const fbDirect = buildDns({ ...withRouting({ ...routing, fallbackDefault: 'direct' }), ipv6: true, ipv6Proxy: 'ipv4' }, GROUPS)
   assert.ok(!fbDirect.rules.some((r) => r.query_type && !r.rule_set))
-  // node(默认)/ ipv6 关着:一条 AAAA 回空都不写
+  // node(默认)/ ipv6 关着:一条 AAAA 回空都不写(HTTPS / SVCB 回空和 v6 分层无关,照常写)
   const node = buildDns({ ...withRouting(routing), ipv6: true, ipv6Proxy: 'node' }, GROUPS)
-  assert.ok(!node.rules.some((r) => r.strategy || r.action === 'predefined'))
+  assert.ok(!node.rules.some((r) => r.strategy || (r.query_type || []).includes('AAAA')))
   const off = buildDns({ ...withRouting(routing), ipv6: false, ipv6Proxy: 'ipv4' }, GROUPS)
-  assert.ok(!off.rules.some((r) => r.strategy || r.action === 'predefined'))
+  assert.ok(!off.rules.some((r) => r.strategy || (r.query_type || []).includes('AAAA')))
   assert.equal(off.strategy, 'ipv4_only')
-  // FakeIP + 降为 IPv4:占位服务器没有 inet6_range;每个走代理的匹配是 AAAA 回空 → 占位(只管 A)→ 真实解析器,
-  // 兜底同样先回空 AAAA 再占位 A
+  // FakeIP + 降为 IPv4:占位服务器没有 inet6_range;每个走代理的匹配是 AAAA 回空 → HTTPS/SVCB 回空 →
+  // 占位(只管 A)→ 真实解析器,兜底同样先回空再占位 A
   const fake = buildDns({ ...withRouting(routing), ipv6: true, ipv6Proxy: 'ipv4', dns: { ...base.dns, fakeIpForProxy: true } }, GROUPS)
   assert.deepEqual(fake.servers.find((s) => s.type === 'fakeip'), { type: 'fakeip', tag: 'dns-fakeip', inet4_range: '198.18.0.0/15' })
   const fakeGoogle = fake.rules.filter((r) => r.rule_set && r.rule_set[0] === 'geosite-google')
-  assert.deepEqual(fakeGoogle.map((r) => r.action || r.server), ['predefined', 'dns-fakeip', 'dns-policy-0'])
-  assert.deepEqual(fakeGoogle[1].query_type, ['A'])
-  assert.deepEqual(fake.rules.slice(-2), [{ query_type: ['AAAA'], action: 'predefined', rcode: 'NOERROR' }, { query_type: ['A'], server: 'dns-fakeip' }])
+  assert.deepEqual(fakeGoogle.map((r) => r.action || r.server), ['predefined', 'predefined', 'dns-fakeip', 'dns-policy-0'])
+  assert.deepEqual(fakeGoogle[2].query_type, ['A'])
+  assert.deepEqual(fake.rules.slice(-3), [
+    { query_type: ['AAAA'], action: 'predefined', rcode: 'NOERROR' },
+    { query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' },
+    { query_type: ['A'], server: 'dns-fakeip' },
+  ])
   const fakeNode = buildDns({ ...withRouting(routing), ipv6: true, ipv6Proxy: 'node', dns: { ...base.dns, fakeIpForProxy: true } }, GROUPS)
   assert.equal(fakeNode.servers.find((s) => s.type === 'fakeip').inet6_range, 'fc00::/18')
 })
@@ -392,7 +419,9 @@ test('ipv6ProxyMode:关着 off、默认 node、降级 ipv4、不进内核 bypass
   const routing = { policies: [{ id: 'g', name: '谷歌', default: '所有-自动', rulesets: ['geosite-google'] }], fallbackDefault: 'proxy' }
   const bypass = buildDns({ ...withRouting(routing), ipv6: true, ipv6Proxy: 'bypass' }, GROUPS)
   assert.equal(bypass.strategy, 'prefer_ipv4')
-  assert.ok(!bypass.rules.some((r) => r.action === 'predefined' || r.strategy))
+  // bypass 只是不入内核的 v6 照常解析:不带 AAAA 回空。HTTPS / SVCB 回空与 v6 分层无关,照常有
+  assert.ok(!bypass.rules.some((r) => (r.query_type || []).includes('AAAA') || r.strategy))
+  assert.ok(bypass.rules.some((r) => isServiceEmpty(r)))
 })
 
 test('F2:IPv6 不进内核(bypass)+ FakeIP:占位只管 A,AAAA 继续交给真实解析器(逐策略和兜底都是);node 模式 A/AAAA 都占位;ipv4 模式 AAAA 回空', () => {
@@ -400,13 +429,86 @@ test('F2:IPv6 不进内核(bypass)+ FakeIP:占位只管 A,AAAA 继续交给真�
   const fake = (over) => buildDns({ ...withRouting(routing), ipv6: true, dns: { ...base.dns, fakeIpForProxy: true }, ...over }, GROUPS)
   const bypass = fake({ ipv6Proxy: 'bypass' })
   const rulesFor = (dns) => dns.rules.filter((r) => r.rule_set && r.rule_set[0] === 'geosite-google')
-  assert.deepEqual(rulesFor(bypass).map((r) => [r.server || r.action, r.query_type || null]), [['dns-fakeip', ['A']], ['dns-policy-0', null]])
-  assert.deepEqual(bypass.rules.at(-1), { query_type: ['A'], server: 'dns-fakeip' })
+  // 每条走代理的匹配:先回空 HTTPS / SVCB(与 v6 无关),再占位 A,最后真解析器
+  assert.deepEqual(rulesFor(bypass).map((r) => [r.server || r.action, r.query_type || null]), [['predefined', ['HTTPS', 'SVCB']], ['dns-fakeip', ['A']], ['dns-policy-0', null]])
+  assert.deepEqual(bypass.rules.slice(-2), [{ query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' }, { query_type: ['A'], server: 'dns-fakeip' }])
   assert.equal(bypass.servers.find((s) => s.type === 'fakeip').inet6_range, undefined)
-  assert.ok(!bypass.rules.some((r) => r.action === 'predefined'))
+  // 没有 AAAA 回空(bypass 的 AAAA 照常交给真实解析器)
+  assert.ok(!bypass.rules.some((r) => (r.query_type || []).includes('AAAA')))
   const node = fake({ ipv6Proxy: 'node' })
-  assert.deepEqual(rulesFor(node)[0].query_type, ['A', 'AAAA'])
-  assert.deepEqual(node.rules.at(-1), { query_type: ['A', 'AAAA'], server: 'dns-fakeip' })
+  assert.deepEqual(rulesFor(node)[1].query_type, ['A', 'AAAA'])
+  assert.deepEqual(node.rules.slice(-2), [{ query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' }, { query_type: ['A', 'AAAA'], server: 'dns-fakeip' }])
   const v4 = fake({ ipv6Proxy: 'ipv4' })
-  assert.deepEqual(rulesFor(v4).map((r) => [r.server || r.action, r.query_type || null]), [['predefined', ['AAAA']], ['dns-fakeip', ['A']], ['dns-policy-0', null]])
+  assert.deepEqual(rulesFor(v4).map((r) => [r.server || r.action, r.query_type || null]), [['predefined', ['AAAA']], ['predefined', ['HTTPS', 'SVCB']], ['dns-fakeip', ['A']], ['dns-policy-0', null]])
+})
+
+// ---------- HTTPS / SVCB 回空(上游 v0.1.200)----------
+test('HTTPS / SVCB 回空:走代理解析的匹配前插一条,直连的匹配不插——本地解析是毫秒级,回空等于顺手关掉 ECH', () => {
+  const routing = {
+    policies: [
+      { id: 'g', name: '谷歌', default: '所有-自动', rulesets: ['geosite-google'] },
+      { id: 'cn', name: '国内', default: 'direct', rulesets: ['geosite-cn'] },
+    ],
+    fallbackDefault: 'proxy',
+  }
+  const dns = buildDns(withRouting(routing), GROUPS)
+  const services = dns.rules.filter((r) => isServiceEmpty(r) || (Array.isArray(r.query_type) && r.query_type.includes('HTTPS') && r.query_type.includes('SVCB')))
+  // 只有走代理的站点集一条 + 兜底走代理一条;走直连的「国内」一条都不该有
+  assert.equal(services.length, 2)
+  assert.deepEqual(services[0], { rule_set: ['geosite-google'], query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' })
+  assert.deepEqual(services[1], { query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' })
+  assert.ok(!services.some((r) => r.rule_set && r.rule_set.includes('geosite-cn')), '直连站点集不能插回空')
+  // 走直连的站点集只有它自己那条真解析器规则
+  const cn = dns.rules.filter((r) => r.rule_set && r.rule_set.includes('geosite-cn'))
+  assert.deepEqual(cn, [{ server: 'dns-direct', rule_set: ['geosite-cn'] }])
+})
+
+test('HTTPS / SVCB 回空:查询类型大写且用 predefined + NOERROR——小写会让内核启动直接 FATAL', () => {
+  const dns = buildDns(withRouting({ fallbackDefault: 'proxy' }), GROUPS)
+  const rule = dns.rules.find((r) => Array.isArray(r.query_type) && r.query_type.includes('HTTPS'))
+  // 官方 1.14.0 实测:query_type 只认大写;小写报 unknown DNS query type 并 FATAL
+  assert.deepEqual(rule.query_type, ['HTTPS', 'SVCB'])
+  assert.equal(rule.action, 'predefined')
+  assert.equal(rule.rcode, 'NOERROR')
+  // predefined 必须带 rcode,否则内核按缺省处理
+  assert.ok(dns.rules.filter((r) => r.action === 'predefined').every((r) => typeof r.rcode === 'string'))
+})
+
+test('HTTPS / SVCB 回空:兜底走直连时一条都不写(没有任何查询会进节点隧道)', () => {
+  for (const routing of [
+    { policies: [{ id: 'cn', name: '国内', default: 'direct', rulesets: ['geosite-cn'] }], fallbackDefault: 'direct' },
+    { policies: [], fallbackDefault: 'direct' },
+  ]) {
+    const dns = buildDns(withRouting(routing), GROUPS)
+    assert.ok(!dns.rules.some((r) => Array.isArray(r.query_type) && r.query_type.includes('HTTPS')), JSON.stringify(dns.rules))
+  }
+})
+
+test('HTTPS / SVCB 回空:DNS 分流整个关掉时也不写(只剩一条直连通道)', () => {
+  const dns = buildDns({ ...base, dns: { ...base.dns, split: false } })
+  assert.ok(!dns.rules || !dns.rules.some((r) => Array.isArray(r.query_type) && r.query_type.includes('HTTPS')))
+})
+
+test('HTTPS / SVCB 回空:紧贴在同一个匹配的真解析器规则之前,不会被别的规则抢先接走', () => {
+  const routing = {
+    policies: [{ id: 'g', name: '谷歌', default: '所有-自动', rulesets: ['geosite-google'], domainSuffix: ['google.com'] }],
+    fallbackDefault: 'proxy',
+  }
+  const dns = buildDns(withRouting(routing), GROUPS)
+  // 只看真解析器规则(带 server 且不是直连):前面紧邻的那条必须是同样匹配上的 HTTPS / SVCB 回空
+  const matchesOf = (r) => {
+    const copy = { ...r }
+    for (const k of ['server', 'query_type', 'action', 'rcode']) delete copy[k]
+    return copy
+  }
+  const targets = dns.rules.filter((r) => r.server && r.server !== 'dns-direct')
+  assert.ok(targets.length >= 2, '至少应有站点集的规则集那份和域名那份')
+  for (const r of targets) {
+    const i = dns.rules.indexOf(r)
+    const prev = dns.rules[i - 1]
+    assert.ok(prev, `规则 ${JSON.stringify(r)} 前没有规则`)
+    assert.equal(prev.action, 'predefined')
+    assert.deepEqual(prev.query_type, ['HTTPS', 'SVCB'])
+    assert.deepEqual(matchesOf(prev), matchesOf(r), '回空规则必须和它守护的那条完全同条件')
+  }
 })

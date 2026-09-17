@@ -32,6 +32,7 @@ import { CLASH_API_BASE } from '../api/penetration.mjs'
 import { kernelTestUrl } from '../engine/test-url.mjs'
 import { configMetaPath } from './deploy.mjs'
 import { processUptime } from './service.mjs'
+import { groupDelayTimeoutMs, groupDelayWaitMs } from './group-delay.mjs'
 
 export const FAILOVER_STATE_KEY = 'openbox/failover-state'
 
@@ -209,10 +210,17 @@ export const createFailoverManager = ({
       return { ok: null, at, reason: err && err.name === 'AbortError' ? 'probe-timeout' : errText(err) }
     }
   }
-  // 让内核按最新结果给多节点页签重选(force=false:刚测过的成员它会跳过,所以这一步很便宜)
+  // 让内核按最新结果给多节点页签重选。注意这个接口**始终 force=true**,并不会跳过刚测过的成员
+  // (以前这里按 force=false 注释、并按 memberCount × timeoutMs 估等待,都偏短):发给内核的
+  // timeout 是整次请求的期限,成员那一层是内核写死的 15 秒、一次 10 个 —— 详见 system/group-delay.mjs。
   const retestSub = async (subTag, url, timeoutMs, memberCount) => {
     try {
-      const res = await withTimeout(fetchImpl, api(`/group/${encodeURIComponent(subTag)}/delay?url=${encodeURIComponent(url)}&timeout=${timeoutMs}`), { headers: headers() }, Math.ceil(memberCount / 10) * timeoutMs + 5000)
+      const res = await withTimeout(
+        fetchImpl,
+        api(`/group/${encodeURIComponent(subTag)}/delay?url=${encodeURIComponent(url)}&timeout=${groupDelayTimeoutMs(memberCount, { memberTimeoutMs: timeoutMs })}`),
+        { headers: headers() },
+        groupDelayWaitMs({ memberCount, memberTimeoutMs: timeoutMs }),
+      )
       return Boolean(res && res.ok)
     } catch { return false }
   }

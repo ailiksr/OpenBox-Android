@@ -14,10 +14,12 @@ import { processUptime } from './service.mjs'
 import { parseDuration } from '../engine/duration.mjs'
 import { isInternalTag } from '../engine/user-groups.mjs'
 import { kernelTestUrl } from '../engine/test-url.mjs'
+import { groupDelayTimeoutMs, groupDelayWaitMs } from './group-delay.mjs'
 
 export { parseDuration }
 
 const DEFAULT_INTERVAL_MS = 3 * 60_000
+const MAX_ROUND_WAIT_MS = 15 * 60_000
 const latestTime = (proxy) => {
   const history = proxy && Array.isArray(proxy.history) ? proxy.history : []
   const last = history[history.length - 1]
@@ -75,12 +77,12 @@ export const createLatencyScheduler = ({
     return history.recordFromProxies(proxies, { kernelStartedAt: await kernelStart(), at: now() })
   }
 
-  // 组测速请求的等待上限:内核最多 10 个并发、每个成员最多 testTimeout,按这轮真要测的成员数算,
-  // 再留 15 秒余量。不能设成固定 20 秒——内核用这个请求的 ctx 跑批测,请求一断后面的成员就
-  // 不测了(正式路由器「所有-自动」212 个成员,以前每轮只测到一半)。
-  const KERNEL_CONCURRENCY = 10
-  const MAX_ROUND_WAIT_MS = 5 * 60_000
-  const roundWaitMs = (dueCount) => Math.min(MAX_ROUND_WAIT_MS, Math.ceil(dueCount / KERNEL_CONCURRENCY) * testTimeoutMs + 15_000)
+  // 组测速请求的两个时间概念必须分开,否则会把好节点误判成超时——内核那个接口的 timeout 是**整次请求的
+  // 期限**,不是每个成员的探测超时。完整依据和实测数据见 system/group-delay.mjs 的模块注释。
+  // 一句话:N 个成员最坏要 ceil(N/10) 波 × 15 秒;把"每个成员 5 秒"直接传进去,成员超过 10 个就会把
+  // 后几波全部误判成超时(并连带删掉它们在 /proxies 里的历史),而延迟三色置灰正是拿这些结果画的。
+  const kernelTimeoutMs = (memberCount) => groupDelayTimeoutMs(memberCount, { memberTimeoutMs: testTimeoutMs })
+  const roundWaitMs = (memberCount) => groupDelayWaitMs({ memberCount, memberTimeoutMs: testTimeoutMs, maxWaitMs: MAX_ROUND_WAIT_MS })
 
   let inFlight = false
   const tick = async () => {
@@ -109,7 +111,9 @@ export const createLatencyScheduler = ({
       // 到点按成员算,不按组算:一个组里各成员上次测的时刻不一样(共用的成员可能刚被别的组测过,
       // 一轮里靠后的成员比靠前的晚一分钟),谁到了 interval 谁就该测。每个组都按此刻最新的
       // /proxies 判,前一个组刚测过的共用成员这里就不算到点。
-      // 内核的组测速是 force=false 的,没到 interval 的成员它自己会跳过,所以一次请求只测到点的。
+      // 这一段只用来决定"这一轮要不要为这个组发请求"。一旦发出去,内核是把**整组**重测一遍的
+      // (这个接口始终 force=true,不理会 interval——见 system/group-delay.mjs),所以下面发请求时
+      // 期限和等待上限都按 g.members.length(全组成员)算,不能按 due.length 算。
       const at = now()
       const due = g.members.filter((m) => {
         const t = latestTime(proxies[m])
@@ -117,9 +121,10 @@ export const createLatencyScheduler = ({
         return !since || at - since >= g.intervalMs
       })
       if (!due.length) continue
+      const memberCount = g.members.length
       let ok = false
       try {
-        const res = await withTimeout(fetchImpl, `${CLASH_API_BASE}/group/${encodeURIComponent(g.tag)}/delay?url=${encodeURIComponent(g.url)}&timeout=${testTimeoutMs}`, { headers: headers() }, roundWaitMs(due.length))
+        const res = await withTimeout(fetchImpl, `${CLASH_API_BASE}/group/${encodeURIComponent(g.tag)}/delay?url=${encodeURIComponent(g.url)}&timeout=${kernelTimeoutMs(memberCount)}`, { headers: headers() }, roundWaitMs(memberCount))
         ok = Boolean(res && res.ok)
         if (!ok) log(`[latency] 组 ${g.tag} 定时测速返回 HTTP ${res ? res.status : 'none'}`)
       } catch (err) {

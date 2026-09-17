@@ -80,12 +80,13 @@ test('到 interval 才测:成员最近一轮结果还新鲜就不发;到点发�
   assert.deepEqual(history.get()['hk-1'].map((x) => x.delay), [93])
   assert.deepEqual(history.get()['hk-3'].map((x) => x.delay), [0])
   // 5 分钟后:有结果的成员到点;hk-1 两组共用,「香港-自动」测完再读一次,「所有-自动」只剩 us-1 到点,
-  // 照样发一次请求(内核只会测 us-1);hk-3 一分钟前刚测过,这轮不算到点
+  // 照样发一次请求(这个接口 force=true,内核会把整组重测一遍);hk-3 一分钟前刚测过,这轮不算到点
   k.setClock(T0 + 5 * 60_000 + 1000)
   const r2 = await s.tick()
   assert.deepEqual(r2.tested, ['香港-自动', '所有-自动'])
   assert.equal(k.calls.filter((u) => u.includes('/group/')).length, 3)
-  assert.ok(k.calls.some((u) => u.includes('/group/%E9%A6%99%E6%B8%AF-%E8%87%AA%E5%8A%A8/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=5000')))
+  // 发给内核的 timeout 是**整次请求的期限**,不是每个成员 5 秒:3 个成员 = 1 波 × 15 秒 + 10 秒余量
+  assert.ok(k.calls.some((u) => u.includes('/group/%E9%A6%99%E6%B8%AF-%E8%87%AA%E5%8A%A8/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=25000')), k.calls.filter((u) => u.includes('/group/')).join('\n'))
   assert.deepEqual(history.get()['hk-1'].map((x) => x.delay), [93, 104])
   assert.deepEqual(history.get()['hk-3'].map((x) => x.delay), [0])
   assert.deepEqual(r2.timeouts, [])
@@ -163,6 +164,36 @@ test('到点按成员算:共用的成员刚被前一个组测过就不算,组里
   assert.deepEqual(r2.tested, ['所有-自动'])
   assert.deepEqual(history.get()['us-1'].map((x) => x.delay), [300, 104])
   assert.equal(history.get()['hk-1'].length, 2)
+})
+
+test('发给内核的组测速 timeout 按**全组**成员数算,不按这一轮到点的成员数:内核接口始终 force=true', async () => {
+  // 12 个成员的大组,但只有 1 个成员到点(其余刚测过)。内核收到请求后会把整组重测一遍,
+  // 所以期限必须按 12 个成员(2 波)算;按到点的 1 个算,后一波就会被误判成超时。
+  const members = Array.from({ length: 12 }, (_, i) => `n${i + 1}`)
+  const cfg = { outbounds: [{ type: 'urltest', tag: '大组', url: 'https://t/generate_204', interval: '5m', outbounds: members }] }
+  const fresh = iso(T0 + 5 * 60_000 - 1000)   // 刚测过(还在 interval 内)
+  const proxies = {}
+  for (const m of members) proxies[m] = { type: 'ss', history: [{ time: fresh, delay: 100 }] }
+  // 只有 n1 的结果老了,到点
+  proxies.n1.history = [{ time: iso(T0), delay: 100 }]
+  const calls = []
+  const fetchImpl = async (url) => {
+    calls.push(String(url))
+    if (String(url).includes('/proxies')) return { ok: true, status: 200, json: async () => ({ proxies: JSON.parse(JSON.stringify(proxies)) }) }
+    return { ok: true, status: 200, json: async () => ({}) }
+  }
+  const ctx = createMockContext({
+    files: { [paths.configPath]: JSON.stringify(cfg), '/proc/123/stat': '123 (sing-box) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0', '/proc/uptime': '1000 0' },
+    execResults: { 'pidof sing-box': { code: 0, stdout: '123\n' } },
+  })
+  const store = memStore()
+  const s = createLatencyScheduler({ store, ctx, paths, history: createLatencyHistory({ store, now: () => T0 + 5 * 60_000 }), fetchImpl, now: () => T0 + 5 * 60_000, log: () => {} })
+  await s.tick()
+  const groupCalls = calls.filter((u) => u.includes('/group/'))
+  assert.equal(groupCalls.length, 1)
+  // 12 个成员 = 2 波 × 15 秒 + 10 秒 = 40 秒(按到点的 1 个算就只会给 25 秒)
+  assert.ok(groupCalls[0].includes('timeout=40000'), groupCalls[0])
+  assert.ok(!groupCalls[0].includes('timeout=25000'))
 })
 
 test('组配置里的测速地址是 http:// 的,发给内核的组测速请求升成 https://(内核不认 http,会悄悄换成 gstatic)', async () => {

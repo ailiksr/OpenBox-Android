@@ -166,11 +166,22 @@ export const buildDnsWithResolvers = (profile, options = {}) => {
   // 占位服务器没有 v6 段,AAAA 落到它上面只会回空——要让 AAAA 继续交给真实解析器(复核 F2)
   const fakeIpTypes = ipv6ProxyMode(profile) === 'node' ? ['A', 'AAAA'] : ['A']
   const emptyAAAA = (match) => ({ ...match, query_type: ['AAAA'], action: 'predefined', rcode: 'NOERROR' })
+  // HTTPS / SVCB 查询回空(上游 v0.1.200)。这两类记录只用于连接优化,不是建连必需,但浏览器会把它们和
+  // A / AAAA 一起并发发出来。走代理解析时,这一次查询要排进节点隧道、等对端回包,实测拖到 4~12 秒才超时
+  // 重试——抓包看到的就是"域名没错、首包却卡好几秒"。回一条空的 NOERROR,浏览器立刻按"没有 HTTPS 记录"
+  // 处理,照常用 A / AAAA 建连(上游 VW/机场线路上的实测结论)。
+  // 只对「走代理解析」的匹配加:走直连的域名必须保留真实 HTTPS 记录——本地解析本来就是毫秒级,回空等于
+  // 顺手把 ECH 也关掉了。
+  // query_type 只认大写(HTTPS / SVCB):小写写法会让内核启动直接 FATAL。已用官方 1.14.0 二进制实测:
+  // 大写 exit 0,小写报 "unknown DNS query type: \"https\"";同一条规则的运行期行为也验证过——HTTPS /
+  // SVCB 查询返回 Status 0 且没有 Answer,A 查询照常拿到真实记录。
+  const emptyServiceTypes = (match) => ({ ...match, query_type: ['HTTPS', 'SVCB'], action: 'predefined', rcode: 'NOERROR' })
   // 规则集 + 域名的匹配拆成两条(1.14 的规则集语义,见 routing-model.mjs 的 splitRuleSetConditions),每一半各带
   // 同一套 AAAA / FakeIP / 真实解析器规则
   const pushProxyRule = (match, tag) => {
     for (const part of splitRuleSetConditions(match)) {
       if (proxyV4Only) rules.push(emptyAAAA(part))
+      rules.push(emptyServiceTypes(part))
       if (fakeIp) rules.push({ ...part, query_type: fakeIpTypes, server: FAKEIP_TAG })
       rules.push({ ...part, server: tag })
     }
@@ -261,6 +272,10 @@ export const buildDnsWithResolvers = (profile, options = {}) => {
   // 兜底走代理 + 代理 v6 降为 IPv4:没命中的域名 AAAA 也回空(final 本身带不了条件,单独一条排在最后;
   // 要在 FakeIP 兜底那条前面,不然 AAAA 先被占位服务器接走)
   if (!fallbackDirect && proxyV4Only) rules.push(emptyAAAA({}))
+  // 兜底走代理:上面都没命中的域名,HTTPS / SVCB 也回空。这一条和 proxyV4Only 无关——只要兜底的解析
+  // 真的走节点隧道,这两类查询就会卡在隧道里等超时,和 v6 降级没有关系。要在 FakeIP 兜底那条之前写,
+  // 顺序上行内也一致:先回空"不是建连必需"的服务类型,再谈 A / AAAA 怎么给。
+  if (!fallbackDirect) rules.push(emptyServiceTypes({}))
   if (fakeIp) {
     // v6 占位段只在"代理也管 v6"时给;降为 IPv4 时 AAAA 已经在上面回空了,占位只管 A
     // v6 占位段只在「代理也管 v6」(交给节点)时给;降级和不进内核都不给——不进内核时终端拿到占位 v6 会直接
