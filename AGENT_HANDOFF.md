@@ -248,6 +248,32 @@ OpenBox-Android-Repo/
 >
 > 工作流已用 `${TAG%%-*}` 显式剥掉后缀，并在打包后**硬校验**产出名与 `update.json` 里声明的 `zipUrl` 文件名逐字一致，不一致直接让流水线失败（`::error::`）。这样不必等用户报「更新失败」才发现对不上。
 
+### 7.2 🚨 当前阻塞：本仓库 GitHub Actions 被平台禁用（v2.0.9 未发布）
+
+**现状（2026-09 实测）**：`https://github.com/ailiksr/OpenBox-Android/actions` 页面显示
+
+```
+GitHub Actions is currently disabled for this repository.
+Please reach out to GitHub Support for assistance.
+```
+
+并且运行记录页为 **"There are no workflow runs yet."**（run 链接数 0，运行统计徽章为 `no status`）。也就是说**本仓库从未跑过任何流水线**，tag 推送不会触发构建。
+
+实测证据链：
+* 已推送 tag `v2.0.9-coloros-ready`（指向 `113d808`），但 Release 资产 `OpenBox-Android-SukiSU-v2.0.9.zip` 与长名版本**双双 404**，`expanded_assets` 可下载资产数 = **0**；
+* v2.0.7 / v2.0.8 两个 Release 的标题是手写的营销标题（`OpenBox for Android v2.0.8 (DNS Filter, Hotspot & Pure UI)`），而 v2.0.9 只是一个**由 tag 自动生成的空壳 Release**，标题就是提交信息 `release: bump version to v2.0.9-coloros-ready` —— 与工作流 `name: "OpenBox for Android ${{ github.ref_name }}"` 的格式不符，反证**工作流没跑**；
+* 两者的 zip 包（90MB / 82MB）是**当时人工上传**的，不是流水线产物。
+
+**已做的止血**：`update.json` 已回滚到 `v2.0.8`（指向实测 HTTP 200、90,540,290 字节的真实包），确保存量用户 OTA 不会撞 404。
+`module.prop` **保留** `versionCode=2090`，等 Actions 恢复后无需再改版本号即可重跑。
+
+**待用户处理**：按页面提示联系 GitHub Support 恢复 Actions，或改用手工上传 zip 的既有流程。
+恢复后重跑方式（二者皆可，因 v2.0.9 tag 已存在）：
+* 删除并重推 tag：`git push origin :refs/tags/v2.0.9-coloros-ready && git push origin v2.0.9-coloros-ready`
+* 或在 Actions 页面用 `workflow_dispatch` 手动触发（工作流已声明该触发器）。
+
+**重新发布前的硬检查**：确认 `update.json` 已被改回 v2.0.9 且资产真的能下载（`HEAD` 到 `zipUrl` 应为 200），否则不要动 `update.json`。
+
 ---
 
 ## 8. 后续演进建议与待办清单 (Roadmap)
