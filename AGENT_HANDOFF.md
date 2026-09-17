@@ -238,8 +238,15 @@ OpenBox-Android-Repo/
 4. **云端全自动构建**：
    * GitHub Actions (`.github/workflows/release.yml`) 监听到 Tag 推送后自动运行；
    * 自动下载最新架构二进制并完成打包；
-   * 自动在 GitHub Releases 创建正式 Release 并上传 `OpenBox-Android-SukiSU-v2.0.9-coloros-ready.zip`；
+   * 自动在 GitHub Releases 创建正式 Release 并上传 `OpenBox-Android-SukiSU-v2.0.9.zip`；
    * 手机端 SukiSU / KernelSU 管理器感知到 `update.json` 变动，提示用户一键 OTA 在线升级！
+
+> ⚠️ **资产命名规则（务必遵守，否则 OTA 会 404）**
+> Tag 名带 `-coloros-ready` 后缀，但**打包资产名与 `update.json` 的 `zipUrl` 一律只用短版本号**：
+> * Tag：`v2.0.9-coloros-ready`
+> * 资产：`OpenBox-Android-SukiSU-v2.0.9.zip` ← 与 v2.0.7 / v2.0.8 两个既有 Release 一致
+>
+> 工作流已用 `${TAG%%-*}` 显式剥掉后缀，并在打包后**硬校验**产出名与 `update.json` 里声明的 `zipUrl` 文件名逐字一致，不一致直接让流水线失败（`::error::`）。这样不必等用户报「更新失败」才发现对不上。
 
 ---
 
