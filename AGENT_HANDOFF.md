@@ -217,29 +217,51 @@ OpenBox-Android-Repo/
 
 ## 7. GitHub Actions 自动化 CI/CD 与发布规范
 
-由于项目已完全转入云端开发，**禁止在本地手动编译臃肿的发布包**，全量发布流已完全由 GitHub Actions 托管。
+由于项目已完全转入云端开发，**正常情况下禁止在本地手动编译臃肿的发布包**，全量发布流由 GitHub Actions 托管。
+> ⚠️ 但**当前 Actions 被平台禁用**（见 7.2），云端发布流暂时不可用；在恢复之前，发版只能走 7.3 的人工兜底流程。
 
 ### 7.1 版本发布步骤（极简操作）
-1. **修改版本契约文件（三处同步）**：
-   * **`module.prop`**：修改 `version=v2.0.9-coloros-ready` 与 `versionCode=2090`；
-   * **`update.json`**：修改 `version`、`versionCode`，以及对应的 `zipUrl`；
-   * **`changelog.md`**：记录本次更新亮点。
-2. **提交并推送代码**：
+> 🔴 **铁律：先确认资产真的能下载，最后才改 `update.json`。**
+> `module.prop` 的 `updateJson` 指向 `main/update.json`，改错一行就等于给**全部存量用户**挂一个 404。
+> 本项目已因此踩过一次坑（v2.0.9），务必按下面的顺序做。
+
+1. **先改 `module.prop`**：`version=v2.0.9-coloros-ready` 与 `versionCode=2090`（这一步不影响存量用户，随时可改）；
+2. **提交并推送代码**，然后**打 tag 并推送**，触发云端构建：
    ```bash
-   git add .
-   git commit -m "release: bump version to v2.0.9-coloros-ready"
+   git add . && git commit -m "release: bump version to v2.0.9-coloros-ready"
    git push origin main
+   git tag v2.0.9-coloros-ready && git push origin v2.0.9-coloros-ready
    ```
-3. **打出 Release Tag 并推送**：
+3. **等构建完成，用 `--expect` 实测"即将发布"的那个版本可下载**（不能只看 Release 页面存在）：
    ```bash
-   git tag v2.0.9-coloros-ready
-   git push origin v2.0.9-coloros-ready
+   node scripts/check-release.mjs --expect v2.0.9-coloros-ready
    ```
-4. **云端全自动构建**：
-   * GitHub Actions (`.github/workflows/release.yml`) 监听到 Tag 推送后自动运行；
-   * 自动下载最新架构二进制并完成打包；
-   * 自动在 GitHub Releases 创建正式 Release 并上传 `OpenBox-Android-SukiSU-v2.0.9.zip`；
-   * 手机端 SukiSU / KernelSU 管理器感知到 `update.json` 变动，提示用户一键 OTA 在线升级！
+   ⚠️ **这一步必须带 `--expect`**。因为此时 `update.json` 还停在**上一个**版本（按下面的顺序，
+   声明是最后才改的），不带 `--expect` 它会去探旧版本、旧版本当然存在 —— 一路绿灯却根本没验证新包，
+   是个假阳性陷阱。
+   退出码 0 才算过。它探活 `zipUrl`（跟随重定向到 objects.githubusercontent.com）、changelog 可访问性、
+   资产名是否为短版本号，以及 `module.prop` 的 `updateJson` 是否指向本仓库 main。
+   ⚠️ Release 页面「存在」≠ 资产存在：tag 推送会**自动生成一个空壳 Release**，标题是提交信息，**0 个资产**。别被它骗了。
+4. **资产确认可下载之后，才改 `update.json`**（`version` / `versionCode` / `zipUrl`）并推送，然后**不带 `--expect` 再跑一次**确认线上声明态可用：
+   ```bash
+   node scripts/check-release.mjs
+   ```
+5. **`changelog.md`** 记录本次更新亮点。
+
+> 🧪 **两道防线（分工不同，都要过）**
+> * `panel/server/system/release-contract.test.mjs`（随全量测试跑，不联网）：管**命名 / 编排 / 同源** —— 短版本号资产名、zipUrl 的 tag 段与 version 一致、versionCode 与 version 同源、update.json 不得宣称比 module.prop 超前的版本、工作流是否仍带剥后缀与硬校验、changelog 是否覆盖该版本。
+> * `scripts/check-release.mjs`（发布前手动跑，联网）：管**资产是否真的能下载**。
+>
+> ⚠️ 别指望前者能兜住资产缺失：本次事故那份错误状态在静态检查下与正常发版**完全一样**，
+> 十条规则全部通过（已实测）。「资产在不在」只能靠真发 HTTP 请求判定。
+
+### 7.3 人工兜底发布流程（Actions 不可用时）
+1. 在**能跑 Linux aarch64 环境**的机器上（或本地交叉准备）按 `release.yml` 的 `Download Precompiled Binaries` 步骤备齐 `bin/sing-box`、`node/bin/node.bin`、`node/lib/ld-musl-aarch64.so.1`；
+2. `cd panel/server && pnpm install --prod`，确认 `node_modules/{express,ws,yaml}` 存在；
+3. 打包：`zip -r OpenBox-Android-SukiSU-v2.0.9.zip * -x ".git*" ".github*" "*.tar.gz" "*.apk"`（**短版本号命名**）；
+4. 在 GitHub Release 页面手工上传该 zip；
+5. 按 7.1 第 3 步实测 200，再改 `update.json`。
+> 注意：本机（Windows）**跑不了**这些二进制（`bin/sing-box` 与 `node/bin/node.bin` 都是 Linux aarch64），必须在 Linux 环境构建。
 
 > ⚠️ **资产命名规则（务必遵守，否则 OTA 会 404）**
 > Tag 名带 `-coloros-ready` 后缀，但**打包资产名与 `update.json` 的 `zipUrl` 一律只用短版本号**：
@@ -272,14 +294,22 @@ Please reach out to GitHub Support for assistance.
 * 删除并重推 tag：`git push origin :refs/tags/v2.0.9-coloros-ready && git push origin v2.0.9-coloros-ready`
 * 或在 Actions 页面用 `workflow_dispatch` 手动触发（工作流已声明该触发器）。
 
-**重新发布前的硬检查**：确认 `update.json` 已被改回 v2.0.9 且资产真的能下载（`HEAD` 到 `zipUrl` 应为 200），否则不要动 `update.json`。
+**重新发布前的硬检查**：先跑 `node scripts/check-release.mjs`。它会直接探活 `update.json` 的 `zipUrl`：
+* 现在（update.json 停在 v2.0.8）→ 退出码 0，因为 v2.0.8 的包真实存在；
+* 一旦你把 update.json 改回 v2.0.9 而资产还没造出来 → 退出码 1，`zip 资产可下载` 那项 FAIL 报 HTTP 404。
+所以**发版顺序必须是**：先让资产真的可下载 → 再改 update.json → 改完再跑一次确认。
 
 ---
 
 ## 8. 后续演进建议与待办清单 (Roadmap)
 
 接手本项目的 AI 智能体可优先在以下方向进行演进：
-- [x] **面板前台实时延迟测速直显与超时置灰 (v2.0.8 已落地)**：
+- [x] **发版契约静态守卫 + 资产探活脚本（v2.0.9 期间补）**：
+  起因是真实事故：`update.json` 被指到一个不存在的资产上，而 `module.prop` 的 `updateJson` 指向 `main/update.json`，等于给全部存量用户挂 404。现补两道防线：
+  * `panel/server/system/release-contract.test.mjs`（10 条，随全量测试跑，不联网）—— 短版本号资产名、`zipUrl` 的 tag 段与 `version` 一致、`versionCode` 与 `version` 同源（本项目编排是 `major*1000+minor*100+patch*10`，即 v2.0.8→2080）、**update.json 不得宣称比 module.prop 超前的版本**（允许滞后：那是"资产还没造好先按住 OTA"的合法持有状态）、工作流是否仍带 `%%-*` 剥后缀与硬校验、changelog 是否覆盖该版本；
+  * `scripts/check-release.mjs`（发布前手动跑，联网）—— 真发 HTTP 请求确认 `zipUrl` 与 changelog 可访问、资产名合规、`updateJson` 指向本仓库 main。
+  ⚠️ **边界要记牢**：静态那 10 条**拦不住**"版本号编排全对、只是资产不存在"这一事故核心形态（已实测：把 update.json 指回事故状态，10 条全部通过）。资产在不在只能靠网络探活。别把前者当成后者的替代。
+- [ ] **面板前台实时延迟测速直显与超时置灰**：
   在“代理”页面为节点卡片全面引入毫秒数字直显、三色分档着色（<100ms 绿 / <300ms 黄 / >=300ms 红）以及不可用/超时节点的半透明置灰（`opacity-45 grayscale`）视觉反馈，单测基线全面维持 0 失败。
 - [x] **HTTPS / SVCB 查询回空（对齐上游 v0.1.200）**：
   分流模式下浏览器会与 A / AAAA 并发发出 HTTPS / SVCB 记录查询；走代理解析时这类查询要在节点隧道里等对端回包，实测拖到 4~12 秒才超时重试，表现为「域名没错、首包却卡好几秒」。`engine/dns.mjs` 新增 `emptyServiceTypes()`，只对**走代理解析**的匹配（`pushProxyRule` 各分支 + 兜底走代理）插入 `predefined / NOERROR` 回空；走直连的域名保留真实 HTTPS 记录（本地解析本就是毫秒级，回空等于顺手关掉 ECH）。
